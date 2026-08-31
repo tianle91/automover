@@ -5,22 +5,39 @@
 #   python3 automover.py --apply   # move
 #
 # Matching is a case-sensitive substring of each top-level basename.
+# types/extensions are optional file filters (union of suffixes).
 
 photos:
   target_path: pictures
   move_targets:
     files: true
     folders: false
+    types:
+      - image
   keywords:
     - IMG_
     - photo
     - DSC_
+
+# every top-level audio/video file, no name filter
+media:
+  target_path: media
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - audio
+      - video
 
 documents:
   target_path: documents
   move_targets:
     files: true
     folders: true
+    types:
+      - documents
+    extensions:
+      - eml
   keywords:
     - invoice
     - report

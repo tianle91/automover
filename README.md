@@ -1,6 +1,6 @@
 # automover
 
-A single-file CLI that reads `automover.yaml` (or `automover.yml`) in the current directory and moves matching **top-level** files and folders into target folders by keyword.
+A single-file CLI that reads `automover.yaml` (or `automover.yml`) in the current directory and moves matching **top-level** files and folders into target folders by keyword and/or file type.
 
 Default mode is a **dry-run**. Nothing is moved until you pass `--apply`.
 
@@ -13,8 +13,12 @@ some_example_group:
   move_targets:
     files: true
     folders: true
+    types:          # optional: image, audio, video, documents
+      - image
+    extensions:     # optional extra suffixes (unioned with types)
+      - heic
   keywords:
-    # case sensitive substrings of the basename
+    # case sensitive substrings of the basename; optional if types/extensions are set
     - first_keyword
     - second_keyword
     - third_keyword
@@ -26,7 +30,17 @@ Each top-level key is a group. Groups are tried in file order.
 |---|---|
 | `target_path` | Destination directory, relative to the working directory. Created if needed. Must stay inside the working directory. |
 | `move_targets.files` / `folders` | Whether this group considers files, folders, or both. At least one must be true. |
-| `keywords` | Case-sensitive **substrings**. An item matches a group if any keyword appears in its basename. |
+| `move_targets.types` | Optional file-type categories. Supported: `image`, `audio`, `video`, `documents`. |
+| `move_targets.extensions` | Optional suffix list (`jpg` or `.jpg`). Unioned with `types`. Case-insensitive. |
+| `keywords` | Case-sensitive **substrings** of the basename. Required if `folders: true`. Optional for files when `types` or `extensions` are set. |
+
+Type filters apply to **files only**. Folders still match on keywords.
+
+A file matches when:
+
+1. `files: true`, and
+2. if `keywords` are set, the basename contains at least one keyword, and
+3. if `types` and/or `extensions` are set, the suffix is in that allow-list
 
 See `examples/automover.yaml` for a fuller sample.
 
@@ -54,8 +68,9 @@ If both `automover.yaml` and `automover.yml` exist, `.yaml` is used and a warnin
 ## Matching rules (v1)
 
 - Scans **only the top level** of the working directory (no recursion).
-- Match is a case-sensitive substring of the **basename**.
-- Multiple keywords in one group are OR.
+- Keyword match is a case-sensitive substring of the **basename**.
+- Multiple keywords in one group are OR. `types` and `extensions` together are OR (union). Keywords **and** the type filter are AND.
+- Suffix matching is case-insensitive (`Photo.JPG` is an image). `tar.gz` is matched as a suffix of the name.
 - Hidden names (starting with `.`), the config file, each group's target directory, and symlinks are skipped.
 - Re-running is idempotent: items already inside a target folder are not scanned.
 

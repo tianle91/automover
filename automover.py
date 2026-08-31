@@ -10,6 +10,10 @@ Example config (automover.yaml or automover.yml):
       move_targets:
         files: true
         folders: true
+        types:          # optional: image, audio, video, documents
+          - image
+        extensions:     # optional extra suffixes, unioned with types
+          - heic
       keywords:
         - first_keyword
         - second_keyword
@@ -24,8 +28,122 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CONFIG_NAMES = ("automover.yaml", "automover.yml")
+
+# Frozen, lowercase, leading-dot suffixes. Matching is case-insensitive.
+FILE_TYPES: dict[str, frozenset[str]] = {
+    "image": frozenset(
+        {
+            ".jpg",
+            ".jpeg",
+            ".jpe",
+            ".jfif",
+            ".png",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+            ".heic",
+            ".heif",
+            ".svg",
+            ".ico",
+            ".raw",
+            ".dng",
+            ".cr2",
+            ".cr3",
+            ".nef",
+            ".arw",
+            ".orf",
+            ".rw2",
+            ".raf",
+            ".avif",
+        }
+    ),
+    "audio": frozenset(
+        {
+            ".mp3",
+            ".wav",
+            ".flac",
+            ".aac",
+            ".m4a",
+            ".ogg",
+            ".opus",
+            ".wma",
+            ".aiff",
+            ".aif",
+            ".aifc",
+            ".alac",
+            ".ape",
+            ".mid",
+            ".midi",
+            ".amr",
+            ".oga",
+            ".mka",
+            ".ac3",
+        }
+    ),
+    "video": frozenset(
+        {
+            ".mp4",
+            ".mkv",
+            ".mov",
+            ".avi",
+            ".webm",
+            ".m4v",
+            ".wmv",
+            ".flv",
+            ".mpeg",
+            ".mpg",
+            ".mpe",
+            ".3gp",
+            ".3g2",
+            ".ogv",
+            ".mts",
+            ".m2ts",
+            ".ts",
+            ".vob",
+            ".m2v",
+            ".asf",
+            ".f4v",
+        }
+    ),
+    "documents": frozenset(
+        {
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".docm",
+            ".odt",
+            ".rtf",
+            ".txt",
+            ".md",
+            ".markdown",
+            ".xls",
+            ".xlsx",
+            ".xlsm",
+            ".csv",
+            ".tsv",
+            ".ppt",
+            ".pptx",
+            ".pptm",
+            ".ods",
+            ".odp",
+            ".epub",
+            ".pages",
+            ".numbers",
+            ".key",
+            ".tex",
+            ".ott",
+            ".ots",
+            ".otp",
+            ".xps",
+            ".djvu",
+            ".djv",
+        }
+    ),
+}
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -211,8 +329,31 @@ def load_simple_yaml(text: str) -> Any:
 # Config schema
 # ---------------------------------------------------------------------------
 
-GROUP_KEYS = frozenset({"target_path", "move_targets", "keywords"})
-MOVE_TARGET_KEYS = frozenset({"files", "folders"})
+REQUIRED_GROUP_KEYS = frozenset({"target_path", "move_targets"})
+OPTIONAL_GROUP_KEYS = frozenset({"keywords"})
+GROUP_KEYS = REQUIRED_GROUP_KEYS | OPTIONAL_GROUP_KEYS
+
+REQUIRED_MOVE_TARGET_KEYS = frozenset({"files", "folders"})
+OPTIONAL_MOVE_TARGET_KEYS = frozenset({"types", "extensions"})
+MOVE_TARGET_KEYS = REQUIRED_MOVE_TARGET_KEYS | OPTIONAL_MOVE_TARGET_KEYS
+
+
+def normalize_extension(raw: str) -> str:
+    ext = raw.strip().lower()
+    if not ext:
+        raise ConfigError("extension must be a non-empty string")
+    if "/" in ext or "\\" in ext:
+        raise ConfigError(f"extension must not contain a path: {raw!r}")
+    if not ext.startswith("."):
+        ext = "." + ext
+    if ext == ".":
+        raise ConfigError(f"invalid extension: {raw!r}")
+    return ext
+
+
+def name_has_extension(filename: str, extensions: Iterable[str]) -> bool:
+    lower = filename.lower()
+    return any(lower.endswith(ext) for ext in extensions)
 
 
 @dataclass(frozen=True)
@@ -223,6 +364,73 @@ class Group:
     move_files: bool
     move_folders: bool
     keywords: tuple[str, ...]
+    types: tuple[str, ...]
+    extensions: tuple[str, ...]
+
+    def allowed_file_extensions(self) -> frozenset[str]:
+        allowed: set[str] = set(self.extensions)
+        for type_name in self.types:
+            allowed.update(FILE_TYPES[type_name])
+        return frozenset(allowed)
+
+
+def _parse_unique_strings(value: Any, *, field: str, group_name: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"group {group_name!r}: {field} must be a non-empty list")
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ConfigError(
+                f"group {group_name!r}: {field} must contain non-empty strings"
+            )
+        if item in seen:
+            raise ConfigError(f"group {group_name!r}: duplicate {field} entry {item!r}")
+        seen.add(item)
+        parsed.append(item)
+    return parsed
+
+
+def _parse_keywords(value: Any, *, group_name: str) -> list[str]:
+    if value is None:
+        return []
+    return _parse_unique_strings(value, field="keywords", group_name=group_name)
+
+
+def _parse_types(value: Any, *, group_name: str) -> list[str]:
+    if value is None:
+        return []
+    parsed = _parse_unique_strings(value, field="move_targets.types", group_name=group_name)
+    known = ", ".join(sorted(FILE_TYPES))
+    for item in parsed:
+        if item not in FILE_TYPES:
+            raise ConfigError(
+                f"group {group_name!r}: unknown type {item!r} "
+                f"(supported: {known})"
+            )
+    return parsed
+
+
+def _parse_extensions(value: Any, *, group_name: str) -> list[str]:
+    if value is None:
+        return []
+    raw = _parse_unique_strings(
+        value, field="move_targets.extensions", group_name=group_name
+    )
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            ext = normalize_extension(item)
+        except ConfigError as exc:
+            raise ConfigError(f"group {group_name!r}: {exc}") from exc
+        if ext in seen:
+            raise ConfigError(
+                f"group {group_name!r}: duplicate extension {ext!r}"
+            )
+        seen.add(ext)
+        parsed.append(ext)
+    return parsed
 
 
 def validate_groups(data: Any, cwd: Path) -> list[Group]:
@@ -241,7 +449,7 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
             raise ConfigError(
                 f"group {name!r}: unknown keys: {', '.join(sorted(extra))}"
             )
-        missing = GROUP_KEYS - set(body)
+        missing = REQUIRED_GROUP_KEYS - set(body)
         if missing:
             raise ConfigError(
                 f"group {name!r}: missing keys: {', '.join(sorted(missing))}"
@@ -270,7 +478,7 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
             raise ConfigError(
                 f"group {name!r}: unknown move_targets keys: {', '.join(sorted(extra_mt))}"
             )
-        missing_mt = MOVE_TARGET_KEYS - set(move_targets)
+        missing_mt = REQUIRED_MOVE_TARGET_KEYS - set(move_targets)
         if missing_mt:
             raise ConfigError(
                 f"group {name!r}: missing move_targets keys: {', '.join(sorted(missing_mt))}"
@@ -286,20 +494,25 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
                 f"group {name!r}: move_targets.files and folders cannot both be false"
             )
 
-        keywords = body["keywords"]
-        if not isinstance(keywords, list) or not keywords:
-            raise ConfigError(f"group {name!r}: keywords must be a non-empty list")
-        parsed_keywords: list[str] = []
-        seen: set[str] = set()
-        for item in keywords:
-            if not isinstance(item, str) or not item:
-                raise ConfigError(
-                    f"group {name!r}: keywords must be non-empty strings"
-                )
-            if item in seen:
-                raise ConfigError(f"group {name!r}: duplicate keyword {item!r}")
-            seen.add(item)
-            parsed_keywords.append(item)
+        parsed_types = _parse_types(move_targets.get("types"), group_name=name)
+        parsed_extensions = _parse_extensions(
+            move_targets.get("extensions"), group_name=name
+        )
+        if (parsed_types or parsed_extensions) and not move_files:
+            raise ConfigError(
+                f"group {name!r}: move_targets.types/extensions require files: true"
+            )
+
+        parsed_keywords = _parse_keywords(body.get("keywords"), group_name=name)
+        if move_folders and not parsed_keywords:
+            raise ConfigError(
+                f"group {name!r}: folders: true requires keywords "
+                "(types/extensions only apply to files)"
+            )
+        if move_files and not parsed_keywords and not parsed_types and not parsed_extensions:
+            raise ConfigError(
+                f"group {name!r}: files: true requires keywords, types, or extensions"
+            )
 
         groups.append(
             Group(
@@ -309,6 +522,8 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
                 move_files=move_files,
                 move_folders=move_folders,
                 keywords=tuple(parsed_keywords),
+                types=tuple(parsed_types),
+                extensions=tuple(parsed_extensions),
             )
         )
     return groups
@@ -375,7 +590,8 @@ def load_config(path: Path, cwd: Path) -> list[Group]:
 @dataclass
 class Match:
     group: Group
-    keyword: str
+    keyword: Optional[str]
+    reason: str
 
 
 @dataclass
@@ -388,6 +604,7 @@ class Action:
     keyword: Optional[str]
     kind: str
     detail: str = ""
+    reason: str = ""
 
     def rel(self, cwd: Path) -> str:
         try:
@@ -407,6 +624,23 @@ def classify_entry(path: Path) -> Optional[str]:
     return "other"
 
 
+def file_type_reason(name: str, group: Group) -> Optional[str]:
+    """How this file hits the group's type filter.
+
+    Returns None if the filter exists and the file does not match.
+    Returns "" if there is no type/extension filter.
+    """
+    if not group.types and not group.extensions:
+        return ""
+    for type_name in group.types:
+        if name_has_extension(name, FILE_TYPES[type_name]):
+            return f"type: {type_name}"
+    for ext in group.extensions:
+        if name_has_extension(name, (ext,)):
+            return f"extension: {ext}"
+    return None
+
+
 def matching_groups(name: str, kind: str, groups: Iterable[Group]) -> list[Match]:
     hits: list[Match] = []
     for group in groups:
@@ -414,10 +648,33 @@ def matching_groups(name: str, kind: str, groups: Iterable[Group]) -> list[Match
             continue
         if kind == "file" and not group.move_files:
             continue
-        for keyword in group.keywords:
-            if keyword in name:
-                hits.append(Match(group=group, keyword=keyword))
-                break
+
+        type_reason = ""
+        if kind == "file":
+            type_reason_or_miss = file_type_reason(name, group)
+            if type_reason_or_miss is None:
+                continue
+            type_reason = type_reason_or_miss
+
+        keyword_hit: Optional[str] = None
+        if group.keywords:
+            for keyword in group.keywords:
+                if keyword in name:
+                    keyword_hit = keyword
+                    break
+            else:
+                continue
+        elif kind != "file" or not type_reason:
+            continue
+
+        parts: list[str] = []
+        if keyword_hit:
+            parts.append(f"keyword: {keyword_hit}")
+        if type_reason:
+            parts.append(type_reason)
+        hits.append(
+            Match(group=group, keyword=keyword_hit, reason=", ".join(parts))
+        )
     return hits
 
 
@@ -459,7 +716,7 @@ def prompt_overlap(
     prompt_out.write(f"\n{action_name!r} matches multiple groups:\n")
     for i, match in enumerate(matches, 1):
         prompt_out.write(
-            f"  [{i}] {match.group.name}  (keyword: {match.keyword}) -> {match.group.target_path}/\n"
+            f"  [{i}] {match.group.name}  ({match.reason}) -> {match.group.target_path}/\n"
         )
     prompt_out.write("  [s] skip this item\n")
     prompt_out.write("  [q] abort\n")
@@ -614,7 +871,7 @@ def plan_moves(
         if not hits:
             if verbose:
                 plan.skipped.append(
-                    Action(entry, None, None, None, "skip_unmatched", "no keyword match")
+                    Action(entry, None, None, None, "skip_unmatched", "no match")
                 )
             continue
 
@@ -645,7 +902,7 @@ def plan_moves(
             )
         else:
             detail = ", ".join(
-                f"{m.group.name} (keyword: {m.keyword})" for m in hits
+                f"{m.group.name} ({m.reason})" for m in hits
             )
             plan.overlaps.append(
                 Action(entry, None, None, None, "overlap", detail)
@@ -663,6 +920,7 @@ def plan_moves(
                         chosen.keyword,
                         "skip_conflict",
                         "destination already exists",
+                        chosen.reason,
                     )
                 )
                 continue
@@ -677,6 +935,7 @@ def plan_moves(
                             chosen.keyword,
                             "skip_conflict",
                             "destination already exists; skipped by user",
+                            chosen.reason,
                         )
                     )
                     continue
@@ -700,6 +959,7 @@ def plan_moves(
                         chosen.keyword,
                         "conflict",
                         "destination already exists",
+                        chosen.reason,
                     )
                 )
                 continue
@@ -715,6 +975,7 @@ def plan_moves(
                 keyword=chosen.keyword,
                 kind="move",
                 detail=note,
+                reason=chosen.reason,
             )
         )
     return plan
@@ -745,6 +1006,7 @@ def perform_moves(plan: Plan) -> list[Action]:
                     keyword=action.keyword,
                     kind="failed",
                     detail=str(exc),
+                    reason=action.reason,
                 )
             )
     plan.moves = remaining
@@ -769,9 +1031,10 @@ def print_plan(
     def emit_move(action: Action) -> None:
         assert action.dest is not None and action.group is not None
         extra = f"  ({action.detail})" if action.detail else ""
+        matched = f"  {action.reason}" if action.reason else ""
         stdout.write(
             f"  {_rel(action.source, cwd)} -> {_rel(action.dest, cwd)}{extra}\n"
-            f"    group: {action.group.name}  keyword: {action.keyword}\n"
+            f"    group: {action.group.name}{matched}\n"
         )
 
     verb = "Moved" if apply else "Would move"
@@ -848,8 +1111,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="automover",
         description=(
-            "Move top-level files and folders into target directories based on "
-            "case-sensitive keyword substrings in automover.yaml. "
+            "Move top-level files and folders using automover.yaml. "
+            "Match on case-sensitive keyword substrings and/or file types. "
             "Default mode is dry-run."
         ),
     )

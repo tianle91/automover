@@ -154,6 +154,99 @@ g:
             with self.assertRaises(automover.ConfigError):
                 automover.load_config(cwd / "automover.yaml", cwd)
 
+    def test_unknown_type(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - photos
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("unknown type", str(ctx.exception))
+            self.assertIn("documents", str(ctx.exception))
+
+    def test_document_singular_rejected(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - document
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(Path(name) / "automover.yaml", Path(name))
+            self.assertIn("unknown type", str(ctx.exception))
+
+    def test_types_require_files(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: false
+    folders: true
+    types:
+      - image
+  keywords:
+    - foo
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(Path(name) / "automover.yaml", Path(name))
+            self.assertIn("require files: true", str(ctx.exception))
+
+    def test_folders_require_keywords(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+    types:
+      - image
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(Path(name) / "automover.yaml", Path(name))
+            self.assertIn("folders: true requires keywords", str(ctx.exception))
+
+    def test_files_require_some_matcher(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(Path(name) / "automover.yaml", Path(name))
+            self.assertIn("requires keywords, types, or extensions", str(ctx.exception))
+
+    def test_duplicate_extension_with_and_without_dot(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+    extensions:
+      - jpg
+      - .JPG
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(Path(name) / "automover.yaml", Path(name))
+            self.assertIn("duplicate extension", str(ctx.exception))
+
     def test_target_escapes_cwd(self):
         text = """\
 g:
@@ -663,6 +756,212 @@ g:
             code, out, err = run(cwd, ["--apply"])
             self.assertEqual(code, 0, err)
             self.assertTrue((cwd / "sorted" / "images" / "IMG_2.jpg").is_file())
+
+
+class TypeFilterTests(unittest.TestCase):
+    def test_supported_type_names(self):
+        self.assertEqual(
+            set(automover.FILE_TYPES),
+            {"image", "audio", "video", "documents"},
+        )
+        self.assertIn(".pdf", automover.FILE_TYPES["documents"])
+        self.assertIn(".jpg", automover.FILE_TYPES["image"])
+        self.assertIn(".mp3", automover.FILE_TYPES["audio"])
+        self.assertIn(".mp4", automover.FILE_TYPES["video"])
+
+    def test_type_only_moves_images(self):
+        text = """\
+g:
+  target_path: pictures
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - image
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "vacation.jpg": "x",
+                "clip.mp4": "y",
+                "notes.txt": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "pictures" / "vacation.jpg").is_file())
+            self.assertTrue((cwd / "clip.mp4").is_file())
+            self.assertTrue((cwd / "notes.txt").is_file())
+            self.assertIn("type: image", out)
+
+    def test_keyword_and_type_are_and(self):
+        text = """\
+g:
+  target_path: pictures
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - image
+  keywords:
+    - trip
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "trip.jpg": "x",
+                "trip.mp4": "y",
+                "other.png": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "pictures" / "trip.jpg").is_file())
+            self.assertTrue((cwd / "trip.mp4").is_file())
+            self.assertTrue((cwd / "other.png").is_file())
+
+    def test_types_and_extensions_union(self):
+        text = """\
+g:
+  target_path: pictures
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - image
+    extensions:
+      - heic
+      - .foo
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "a.png": "x",
+                "b.heic": "y",
+                "c.foo": "z",
+                "d.txt": "no",
+            }
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "pictures" / "a.png").is_file())
+            self.assertTrue((cwd / "pictures" / "b.heic").is_file())
+            self.assertTrue((cwd / "pictures" / "c.foo").is_file())
+            self.assertTrue((cwd / "d.txt").is_file())
+
+    def test_extension_case_insensitive(self):
+        text = """\
+g:
+  target_path: pictures
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - image
+"""
+        with write_tree({"automover.yaml": text, "Photo.JPG": "x"}) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "pictures" / "Photo.JPG").is_file())
+
+    def test_compound_extension(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+    extensions:
+      - tar.gz
+"""
+        with write_tree(
+            {"automover.yaml": text, "backup.tar.gz": "x", "backup.gz": "y"}
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "out" / "backup.tar.gz").is_file())
+            self.assertTrue((cwd / "backup.gz").is_file())
+
+    def test_documents_type(self):
+        text = """\
+g:
+  target_path: docs
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - documents
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "report.pdf": "x",
+                "sheet.xlsx": "y",
+                "readme.md": "z",
+                "song.mp3": "no",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "docs" / "report.pdf").is_file())
+            self.assertTrue((cwd / "docs" / "sheet.xlsx").is_file())
+            self.assertTrue((cwd / "docs" / "readme.md").is_file())
+            self.assertTrue((cwd / "song.mp3").is_file())
+            self.assertIn("type: documents", out)
+
+    def test_audio_and_video_types(self):
+        text = """\
+g:
+  target_path: media
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - audio
+      - video
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "song.mp3": "x",
+                "clip.mkv": "y",
+                "pic.png": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "media" / "song.mp3").is_file())
+            self.assertTrue((cwd / "media" / "clip.mkv").is_file())
+            self.assertTrue((cwd / "pic.png").is_file())
+
+    def test_folders_ignore_type_filter(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+    types:
+      - image
+  keywords:
+    - album
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "album.jpg": "x",
+                "album.txt": "y",
+                "album_dir": None,
+            }
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "out" / "album.jpg").is_file())
+            self.assertTrue((cwd / "album.txt").is_file())
+            self.assertTrue((cwd / "out" / "album_dir").is_dir())
 
 
 class UniqueNameTests(unittest.TestCase):
