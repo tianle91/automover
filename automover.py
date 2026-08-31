@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""Keyword-based file/folder mover driven by automover.yaml.
+
+Default mode is a dry-run. Pass --apply to move anything.
+
+Example config (automover.yaml or automover.yml):
+
+    some_example_group:
+      target_path: target_folder
+      move_targets:
+        files: true
+        folders: true
+      keywords:
+        - first_keyword
+        - second_keyword
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, TextIO
+
+VERSION = "0.1.0"
+CONFIG_NAMES = ("automover.yaml", "automover.yml")
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_PARTIAL = 2
+
+
+class ConfigError(Exception):
+    """Invalid config file or flags."""
+
+
+class UserAbort(Exception):
+    """User asked to stop during a prompt."""
+
+
+# ---------------------------------------------------------------------------
+# YAML subset loader (stdlib only)
+# Supports mappings, lists, booleans, quoted/unquoted strings, and comments.
+# ---------------------------------------------------------------------------
+
+
+def _strip_inline_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and in_double:
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i].rstrip()
+        i += 1
+    return line.rstrip()
+
+
+def _unquote_string(raw: str) -> str:
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        inner = raw[1:-1]
+        if raw[0] == '"':
+            inner = (
+                inner.replace(r"\\", "\\")
+                .replace(r"\"", '"')
+                .replace(r"\n", "\n")
+                .replace(r"\t", "\t")
+            )
+        return inner
+    return raw
+
+
+def _parse_scalar(raw: str) -> Any:
+    raw = raw.strip()
+    if raw in ("true", "True"):
+        return True
+    if raw in ("false", "False"):
+        return False
+    if raw in ("null", "~"):
+        return None
+    return _unquote_string(raw)
+
+
+def _parse_key(raw: str, lineno: int) -> str:
+    raw = raw.strip()
+    if not raw:
+        raise ConfigError(f"line {lineno}: mapping key must be a non-empty string")
+    key = _unquote_string(raw)
+    if not isinstance(key, str) or not key:
+        raise ConfigError(f"line {lineno}: mapping key must be a non-empty string")
+    return key
+
+
+def _split_mapping_entry(content: str, lineno: int) -> tuple[str, bool, str]:
+    in_single = False
+    in_double = False
+    colon = None
+    i = 0
+    while i < len(content):
+        ch = content[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == ":" and not in_single and not in_double:
+            colon = i
+            break
+        i += 1
+    if colon is None:
+        raise ConfigError(f"line {lineno}: expected 'key:' in mapping, got {content!r}")
+    key = _parse_key(content[:colon], lineno)
+    rest = content[colon + 1 :].strip()
+    if rest == "":
+        return key, False, ""
+    return key, True, rest
+
+
+def _parse_value(lines: list[tuple[int, int, str]], idx: int, indent: int) -> tuple[Any, int]:
+    if idx >= len(lines):
+        raise ConfigError("unexpected end of file")
+    lineno, line_indent, content = lines[idx]
+    if line_indent != indent:
+        raise ConfigError(f"line {lineno}: inconsistent indentation")
+    if content == "-" or content.startswith("- "):
+        return _parse_sequence(lines, idx, indent)
+    return _parse_mapping(lines, idx, indent)
+
+
+def _parse_mapping(
+    lines: list[tuple[int, int, str]], idx: int, indent: int
+) -> tuple[dict[str, Any], int]:
+    result: dict[str, Any] = {}
+    while idx < len(lines):
+        lineno, line_indent, content = lines[idx]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            raise ConfigError(f"line {lineno}: unexpected indentation")
+        if content == "-" or content.startswith("- "):
+            raise ConfigError(f"line {lineno}: expected mapping key, got list item")
+        key, has_inline, inline = _split_mapping_entry(content, lineno)
+        if key in result:
+            raise ConfigError(f"line {lineno}: duplicate key {key!r}")
+        idx += 1
+        if has_inline:
+            result[key] = _parse_scalar(inline)
+            continue
+        if idx >= len(lines) or lines[idx][1] <= indent:
+            result[key] = None
+            continue
+        child_indent = lines[idx][1]
+        value, idx = _parse_value(lines, idx, child_indent)
+        result[key] = value
+    return result, idx
+
+
+def _parse_sequence(
+    lines: list[tuple[int, int, str]], idx: int, indent: int
+) -> tuple[list[Any], int]:
+    result: list[Any] = []
+    while idx < len(lines):
+        lineno, line_indent, content = lines[idx]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            raise ConfigError(f"line {lineno}: unexpected indentation")
+        if content != "-" and not content.startswith("- "):
+            break
+        item = "" if content == "-" else content[2:].strip()
+        idx += 1
+        if item == "":
+            if idx < len(lines) and lines[idx][1] > indent:
+                value, idx = _parse_value(lines, idx, lines[idx][1])
+                result.append(value)
+            else:
+                result.append(None)
+        else:
+            result.append(_parse_scalar(item))
+    return result, idx
+
+
+def load_simple_yaml(text: str) -> Any:
+    lines: list[tuple[int, int, str]] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if "\t" in raw:
+            raise ConfigError(f"line {lineno}: tabs are not allowed; use spaces")
+        stripped = _strip_inline_comment(raw)
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        lines.append((lineno, indent, stripped.strip()))
+    if not lines:
+        raise ConfigError("YAML file is empty")
+    value, idx = _parse_value(lines, 0, lines[0][1])
+    if idx != len(lines):
+        lineno, _, content = lines[idx]
+        raise ConfigError(f"line {lineno}: unexpected content {content!r}")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Config schema
+# ---------------------------------------------------------------------------
+
+GROUP_KEYS = frozenset({"target_path", "move_targets", "keywords"})
+MOVE_TARGET_KEYS = frozenset({"files", "folders"})
+
+
+@dataclass(frozen=True)
+class Group:
+    name: str
+    target_path: str
+    target: Path
+    move_files: bool
+    move_folders: bool
+    keywords: tuple[str, ...]
+
+
+def validate_groups(data: Any, cwd: Path) -> list[Group]:
+    if not isinstance(data, dict) or not data:
+        raise ConfigError("config root must be a non-empty mapping of group names")
+
+    groups: list[Group] = []
+    for name, body in data.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError("group names must be non-empty strings")
+        if not isinstance(body, dict):
+            raise ConfigError(f"group {name!r}: must be a mapping")
+
+        extra = set(body) - GROUP_KEYS
+        if extra:
+            raise ConfigError(
+                f"group {name!r}: unknown keys: {', '.join(sorted(extra))}"
+            )
+        missing = GROUP_KEYS - set(body)
+        if missing:
+            raise ConfigError(
+                f"group {name!r}: missing keys: {', '.join(sorted(missing))}"
+            )
+
+        target_path = body["target_path"]
+        if not isinstance(target_path, str) or not target_path.strip():
+            raise ConfigError(f"group {name!r}: target_path must be a non-empty string")
+        target_path = target_path.strip()
+        if Path(target_path).is_absolute():
+            raise ConfigError(
+                f"group {name!r}: target_path must be relative, not {target_path!r}"
+            )
+
+        target = _resolve_inside_cwd(cwd, target_path, group_name=name)
+        if target.exists() and not target.is_dir():
+            raise ConfigError(
+                f"group {name!r}: target_path {target_path!r} exists and is not a directory"
+            )
+
+        move_targets = body["move_targets"]
+        if not isinstance(move_targets, dict):
+            raise ConfigError(f"group {name!r}: move_targets must be a mapping")
+        extra_mt = set(move_targets) - MOVE_TARGET_KEYS
+        if extra_mt:
+            raise ConfigError(
+                f"group {name!r}: unknown move_targets keys: {', '.join(sorted(extra_mt))}"
+            )
+        missing_mt = MOVE_TARGET_KEYS - set(move_targets)
+        if missing_mt:
+            raise ConfigError(
+                f"group {name!r}: missing move_targets keys: {', '.join(sorted(missing_mt))}"
+            )
+        move_files = move_targets["files"]
+        move_folders = move_targets["folders"]
+        if not isinstance(move_files, bool) or not isinstance(move_folders, bool):
+            raise ConfigError(
+                f"group {name!r}: move_targets.files and folders must be booleans"
+            )
+        if not move_files and not move_folders:
+            raise ConfigError(
+                f"group {name!r}: move_targets.files and folders cannot both be false"
+            )
+
+        keywords = body["keywords"]
+        if not isinstance(keywords, list) or not keywords:
+            raise ConfigError(f"group {name!r}: keywords must be a non-empty list")
+        parsed_keywords: list[str] = []
+        seen: set[str] = set()
+        for item in keywords:
+            if not isinstance(item, str) or not item:
+                raise ConfigError(
+                    f"group {name!r}: keywords must be non-empty strings"
+                )
+            if item in seen:
+                raise ConfigError(f"group {name!r}: duplicate keyword {item!r}")
+            seen.add(item)
+            parsed_keywords.append(item)
+
+        groups.append(
+            Group(
+                name=name,
+                target_path=target_path,
+                target=target,
+                move_files=move_files,
+                move_folders=move_folders,
+                keywords=tuple(parsed_keywords),
+            )
+        )
+    return groups
+
+
+def _resolve_inside_cwd(cwd: Path, target_path: str, group_name: str) -> Path:
+    cwd_r = cwd.resolve()
+    resolved = (cwd / target_path).resolve()
+    try:
+        resolved.relative_to(cwd_r)
+    except ValueError as exc:
+        raise ConfigError(
+            f"group {group_name!r}: target_path {target_path!r} escapes the working directory"
+        ) from exc
+    if resolved == cwd_r:
+        raise ConfigError(
+            f"group {group_name!r}: target_path {target_path!r} must be a subdirectory, "
+            "not the working directory"
+        )
+    return resolved
+
+
+def find_config(cwd: Path, explicit: Optional[Path], warn: Callable[[str], None]) -> Path:
+    if explicit is not None:
+        path = explicit if explicit.is_absolute() else cwd / explicit
+        if not path.is_file():
+            raise ConfigError(f"config not found: {path}")
+        return path.resolve()
+
+    yaml_path = cwd / "automover.yaml"
+    yml_path = cwd / "automover.yml"
+    yaml_exists = yaml_path.is_file()
+    yml_exists = yml_path.is_file()
+    if yaml_exists and yml_exists:
+        warn("both automover.yaml and automover.yml exist; using automover.yaml")
+        return yaml_path.resolve()
+    if yaml_exists:
+        return yaml_path.resolve()
+    if yml_exists:
+        return yml_path.resolve()
+    raise ConfigError(
+        f"no automover.yaml or automover.yml in {cwd} "
+        "(pass --config PATH to use another file)"
+    )
+
+
+def load_config(path: Path, cwd: Path) -> list[Group]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not read config {path}: {exc}") from exc
+    try:
+        data = load_simple_yaml(text)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+    return validate_groups(data, cwd)
+
+
+# ---------------------------------------------------------------------------
+# Matching and planning
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Match:
+    group: Group
+    keyword: str
+
+
+@dataclass
+class Action:
+    """One planned or completed operation."""
+
+    source: Path
+    dest: Optional[Path]
+    group: Optional[Group]
+    keyword: Optional[str]
+    kind: str
+    detail: str = ""
+
+    def rel(self, cwd: Path) -> str:
+        try:
+            return str(self.source.relative_to(cwd))
+        except ValueError:
+            return str(self.source)
+
+
+def classify_entry(path: Path) -> Optional[str]:
+    """Return 'dir', 'file', or None if the entry should be skipped as unsupported."""
+    if path.is_symlink():
+        return "symlink"
+    if path.is_dir():
+        return "dir"
+    if path.is_file():
+        return "file"
+    return "other"
+
+
+def matching_groups(name: str, kind: str, groups: Iterable[Group]) -> list[Match]:
+    hits: list[Match] = []
+    for group in groups:
+        if kind == "dir" and not group.move_folders:
+            continue
+        if kind == "file" and not group.move_files:
+            continue
+        for keyword in group.keywords:
+            if keyword in name:
+                hits.append(Match(group=group, keyword=keyword))
+                break
+    return hits
+
+
+def unique_destination(parent: Path, name: str) -> Path:
+    candidate = parent / name
+    if not candidate.exists():
+        return candidate
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    n = 1
+    while n <= 10_000:
+        candidate = parent / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+    raise OSError(f"could not find a free name for {name!r} in {parent}")
+
+
+def can_prompt(stdin: TextIO) -> bool:
+    isatty = getattr(stdin, "isatty", lambda: False)
+    return bool(isatty())
+
+
+def _read_choice(stdin: TextIO, stdout: TextIO, prompt: str) -> str:
+    stdout.write(prompt)
+    stdout.flush()
+    line = stdin.readline()
+    if line == "":
+        raise UserAbort("end of input during prompt")
+    return line.strip()
+
+
+def prompt_overlap(
+    action_name: str,
+    matches: list[Match],
+    stdin: TextIO,
+    prompt_out: TextIO,
+) -> Optional[Match]:
+    prompt_out.write(f"\n{action_name!r} matches multiple groups:\n")
+    for i, match in enumerate(matches, 1):
+        prompt_out.write(
+            f"  [{i}] {match.group.name}  (keyword: {match.keyword}) -> {match.group.target_path}/\n"
+        )
+    prompt_out.write("  [s] skip this item\n")
+    prompt_out.write("  [q] abort\n")
+    while True:
+        choice = _read_choice(stdin, prompt_out, "Choose group or action: ")
+        if choice.lower() == "q":
+            raise UserAbort("aborted by user")
+        if choice.lower() == "s":
+            return None
+        if choice.isdigit():
+            n = int(choice)
+            if 1 <= n <= len(matches):
+                return matches[n - 1]
+        prompt_out.write(f"  invalid choice {choice!r}; enter a listed number, s, or q\n")
+
+
+def prompt_conflict(
+    source_name: str,
+    dest: Path,
+    cwd: Path,
+    stdin: TextIO,
+    prompt_out: TextIO,
+) -> Optional[Path]:
+    try:
+        dest_rel = dest.relative_to(cwd)
+    except ValueError:
+        dest_rel = dest
+    prompt_out.write(
+        f"\nConflict: {source_name!r} already exists at {dest_rel.as_posix()} (never overwrites)\n"
+    )
+    prompt_out.write("  [s] skip this item\n")
+    prompt_out.write("  [r] rename to a unique name\n")
+    prompt_out.write("  [q] abort\n")
+    while True:
+        choice = _read_choice(stdin, prompt_out, "Choose resolution: ")
+        lowered = choice.lower()
+        if lowered == "q":
+            raise UserAbort("aborted by user")
+        if lowered == "s":
+            return None
+        if lowered == "r":
+            return unique_destination(dest.parent, dest.name)
+        prompt_out.write(f"  invalid choice {choice!r}; enter s, r, or q\n")
+
+
+@dataclass
+class Plan:
+    moves: list[Action] = field(default_factory=list)
+    skipped: list[Action] = field(default_factory=list)
+    overlaps: list[Action] = field(default_factory=list)
+    conflicts: list[Action] = field(default_factory=list)
+
+
+def _self_path() -> Optional[Path]:
+    try:
+        return Path(__file__).resolve()
+    except (NameError, OSError):
+        return None
+
+
+def collect_candidates(
+    cwd: Path,
+    config_path: Path,
+    groups: list[Group],
+    verbose: bool,
+) -> tuple[list[Path], list[Action]]:
+    skipped: list[Action] = []
+    targets = {g.target.resolve() for g in groups}
+    config_resolved = config_path.resolve()
+    self_path = _self_path()
+    names_to_skip = set(CONFIG_NAMES)
+
+    entries: list[Path] = []
+    try:
+        listed = sorted(cwd.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        raise ConfigError(f"could not list {cwd}: {exc}") from exc
+
+    for entry in listed:
+        name = entry.name
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            skipped.append(
+                Action(entry, None, None, None, "skip_unreadable", "could not resolve path")
+            )
+            continue
+
+        if resolved == config_resolved or name in names_to_skip:
+            if verbose:
+                skipped.append(
+                    Action(entry, None, None, None, "skip_config", "config file")
+                )
+            continue
+        if self_path is not None and resolved == self_path:
+            if verbose:
+                skipped.append(
+                    Action(entry, None, None, None, "skip_self", "automover script")
+                )
+            continue
+        if name.startswith("."):
+            if verbose:
+                skipped.append(
+                    Action(entry, None, None, None, "skip_hidden", "hidden entry")
+                )
+            continue
+        if resolved in targets:
+            if verbose:
+                skipped.append(
+                    Action(
+                        entry, None, None, None, "skip_target", "group target directory"
+                    )
+                )
+            continue
+
+        kind = classify_entry(entry)
+        if kind == "symlink":
+            skipped.append(
+                Action(entry, None, None, None, "skip_symlink", "symlinks are not moved")
+            )
+            continue
+        if kind == "other":
+            skipped.append(
+                Action(entry, None, None, None, "skip_other", "not a regular file or folder")
+            )
+            continue
+        entries.append(entry)
+
+    return entries, skipped
+
+
+def plan_moves(
+    cwd: Path,
+    entries: list[Path],
+    groups: list[Group],
+    *,
+    apply: bool,
+    skip_conflicts: bool,
+    first_group_wins: bool,
+    stdin: TextIO,
+    prompt_out: TextIO,
+    verbose: bool,
+) -> Plan:
+    plan = Plan()
+    interactive = can_prompt(stdin)
+
+    for entry in entries:
+        kind = classify_entry(entry)
+        if kind not in ("file", "dir"):
+            continue
+        hits = matching_groups(entry.name, kind, groups)
+        if not hits:
+            if verbose:
+                plan.skipped.append(
+                    Action(entry, None, None, None, "skip_unmatched", "no keyword match")
+                )
+            continue
+
+        chosen: Optional[Match]
+        if len(hits) == 1:
+            chosen = hits[0]
+        elif first_group_wins:
+            chosen = hits[0]
+        elif apply and interactive:
+            chosen = prompt_overlap(entry.name, hits, stdin, prompt_out)
+            if chosen is None:
+                plan.skipped.append(
+                    Action(
+                        entry,
+                        None,
+                        None,
+                        None,
+                        "skip_overlap",
+                        "matches multiple groups; skipped by user",
+                    )
+                )
+                continue
+        elif apply and not interactive:
+            names = ", ".join(m.group.name for m in hits)
+            raise ConfigError(
+                f"{entry.name!r} matches multiple groups ({names}). "
+                "Re-run with --first-group-wins, or run --apply in a terminal to choose."
+            )
+        else:
+            detail = ", ".join(
+                f"{m.group.name} (keyword: {m.keyword})" for m in hits
+            )
+            plan.overlaps.append(
+                Action(entry, None, None, None, "overlap", detail)
+            )
+            continue
+
+        dest = chosen.group.target / entry.name
+        if dest.exists():
+            if skip_conflicts:
+                plan.skipped.append(
+                    Action(
+                        entry,
+                        dest,
+                        chosen.group,
+                        chosen.keyword,
+                        "skip_conflict",
+                        "destination already exists",
+                    )
+                )
+                continue
+            if apply and interactive:
+                renamed = prompt_conflict(entry.name, dest, cwd, stdin, prompt_out)
+                if renamed is None:
+                    plan.skipped.append(
+                        Action(
+                            entry,
+                            dest,
+                            chosen.group,
+                            chosen.keyword,
+                            "skip_conflict",
+                            "destination already exists; skipped by user",
+                        )
+                    )
+                    continue
+                dest = renamed
+            elif apply and not interactive:
+                try:
+                    dest_rel = dest.relative_to(cwd)
+                except ValueError:
+                    dest_rel = dest
+                raise ConfigError(
+                    f"destination already exists: {dest_rel.as_posix()} "
+                    "(never overwrites). Re-run with --skip-conflicts, "
+                    "or run --apply in a terminal to choose skip/rename."
+                )
+            else:
+                plan.conflicts.append(
+                    Action(
+                        entry,
+                        dest,
+                        chosen.group,
+                        chosen.keyword,
+                        "conflict",
+                        "destination already exists",
+                    )
+                )
+                continue
+
+        note = ""
+        if dest.name != entry.name:
+            note = "renamed because destination existed"
+        plan.moves.append(
+            Action(
+                source=entry,
+                dest=dest,
+                group=chosen.group,
+                keyword=chosen.keyword,
+                kind="move",
+                detail=note,
+            )
+        )
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Execute and report
+# ---------------------------------------------------------------------------
+
+
+def perform_moves(plan: Plan) -> list[Action]:
+    failed: list[Action] = []
+    remaining: list[Action] = []
+    for action in plan.moves:
+        assert action.dest is not None
+        try:
+            action.dest.parent.mkdir(parents=True, exist_ok=True)
+            if action.dest.exists():
+                raise OSError("destination appeared before the move (never overwrites)")
+            shutil.move(str(action.source), str(action.dest))
+            remaining.append(action)
+        except OSError as exc:
+            failed.append(
+                Action(
+                    source=action.source,
+                    dest=action.dest,
+                    group=action.group,
+                    keyword=action.keyword,
+                    kind="failed",
+                    detail=str(exc),
+                )
+            )
+    plan.moves = remaining
+    return failed
+
+
+def _rel(path: Path, cwd: Path) -> str:
+    try:
+        return path.relative_to(cwd).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def print_plan(
+    plan: Plan,
+    cwd: Path,
+    *,
+    apply: bool,
+    verbose: bool,
+    stdout: TextIO,
+) -> None:
+    def emit_move(action: Action) -> None:
+        assert action.dest is not None and action.group is not None
+        extra = f"  ({action.detail})" if action.detail else ""
+        stdout.write(
+            f"  {_rel(action.source, cwd)} -> {_rel(action.dest, cwd)}{extra}\n"
+            f"    group: {action.group.name}  keyword: {action.keyword}\n"
+        )
+
+    verb = "Moved" if apply else "Would move"
+    if plan.moves:
+        stdout.write(f"{verb}:\n")
+        for action in plan.moves:
+            emit_move(action)
+        stdout.write("\n")
+
+    if plan.overlaps:
+        stdout.write("Would prompt (multi-group overlap):\n")
+        for action in plan.overlaps:
+            stdout.write(f"  {action.rel(cwd)}\n    matches: {action.detail}\n")
+        stdout.write(
+            "  pass --first-group-wins to use the first group in file order, "
+            "or re-run with --apply in a terminal to choose.\n\n"
+        )
+
+    if plan.conflicts:
+        stdout.write("Would prompt (destination exists; never overwrites):\n")
+        for action in plan.conflicts:
+            dest = _rel(action.dest, cwd) if action.dest is not None else "?"
+            stdout.write(f"  {action.rel(cwd)} -> {dest}\n")
+        stdout.write(
+            "  pass --skip-conflicts to skip these items, "
+            "or re-run with --apply in a terminal to choose skip/rename.\n\n"
+        )
+
+    skipped_to_show = plan.skipped if verbose else [
+        a for a in plan.skipped if a.kind in {"skip_conflict", "skip_overlap", "skip_symlink", "skip_other"}
+    ]
+    if skipped_to_show:
+        stdout.write("Skipped:\n")
+        for action in skipped_to_show:
+            stdout.write(f"  {action.rel(cwd)}  ({action.detail or action.kind})\n")
+        stdout.write("\n")
+
+
+def print_summary(
+    plan: Plan,
+    failed: list[Action],
+    *,
+    apply: bool,
+    unmatched_verbose: int,
+    stdout: TextIO,
+) -> None:
+    n_move = len(plan.moves)
+    n_skip = len(plan.skipped)
+    n_overlap = len(plan.overlaps)
+    n_conflict = len(plan.conflicts)
+    n_fail = len(failed)
+    if apply:
+        stdout.write(
+            f"Summary: {n_move} moved, {n_skip} skipped, {n_fail} failed"
+        )
+    else:
+        stdout.write(
+            f"Summary: {n_move} would move, {n_overlap} overlap, "
+            f"{n_conflict} conflict, {n_skip} skipped, {n_fail} failed"
+        )
+    if unmatched_verbose:
+        stdout.write(f", {unmatched_verbose} unmatched")
+    stdout.write("\n")
+    if not apply:
+        stdout.write("Dry-run: no files were moved. Re-run with --apply to perform moves.\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="automover",
+        description=(
+            "Move top-level files and folders into target directories based on "
+            "case-sensitive keyword substrings in automover.yaml. "
+            "Default mode is dry-run."
+        ),
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform moves. Default is dry-run (report only).",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Config file path (default: automover.yaml or automover.yml in the working directory)",
+    )
+    parser.add_argument(
+        "--cwd",
+        type=Path,
+        help="Working directory to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "--skip-conflicts",
+        action="store_true",
+        help=(
+            "If a destination name already exists, skip the item instead of prompting. "
+            "Never overwrites."
+        ),
+    )
+    parser.add_argument(
+        "--first-group-wins",
+        action="store_true",
+        help=(
+            "If an item matches multiple groups, use the first group in file order "
+            "instead of prompting."
+        ),
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate the config file and exit without scanning.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="List skipped unmatched, hidden, config, and target entries.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"automover {VERSION}",
+    )
+    return parser
+
+
+def main(
+    argv: Optional[list[str]] = None,
+    stdin: Optional[TextIO] = None,
+    stdout: Optional[TextIO] = None,
+    stderr: Optional[TextIO] = None,
+) -> int:
+    stdin = stdin if stdin is not None else sys.stdin
+    stdout = stdout if stdout is not None else sys.stdout
+    stderr = stderr if stderr is not None else sys.stderr
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    cwd = (args.cwd if args.cwd is not None else Path.cwd())
+    try:
+        cwd = cwd.resolve()
+    except OSError as exc:
+        stderr.write(f"error: could not resolve working directory: {exc}\n")
+        return EXIT_USAGE
+    if not cwd.is_dir():
+        stderr.write(f"error: working directory is not a directory: {cwd}\n")
+        return EXIT_USAGE
+
+    def warn(message: str) -> None:
+        stderr.write(f"warning: {message}\n")
+
+    try:
+        config_path = find_config(cwd, args.config, warn)
+        groups = load_config(config_path, cwd)
+    except ConfigError as exc:
+        stderr.write(f"error: {exc}\n")
+        return EXIT_USAGE
+
+    if args.validate:
+        stdout.write(f"Config OK: {config_path} ({len(groups)} group(s))\n")
+        return EXIT_OK
+
+    mode = "apply" if args.apply else "dry-run"
+    stdout.write(f"== automover {mode} ==\n")
+    stdout.write(f"Config: {config_path}\n")
+    stdout.write(f"Working directory: {cwd}\n\n")
+
+    try:
+        entries, early_skipped = collect_candidates(
+            cwd, config_path, groups, verbose=args.verbose
+        )
+        plan = plan_moves(
+            cwd,
+            entries,
+            groups,
+            apply=args.apply,
+            skip_conflicts=args.skip_conflicts,
+            first_group_wins=args.first_group_wins,
+            stdin=stdin,
+            prompt_out=stderr,
+            verbose=args.verbose,
+        )
+        plan.skipped = early_skipped + plan.skipped
+    except UserAbort as exc:
+        stderr.write(f"aborted: {exc}\n")
+        return EXIT_USAGE
+    except ConfigError as exc:
+        stderr.write(f"error: {exc}\n")
+        return EXIT_USAGE
+
+    failed: list[Action] = []
+    if args.apply:
+        failed = perform_moves(plan)
+        for action in failed:
+            stderr.write(
+                f"error: failed to move {_rel(action.source, cwd)}: {action.detail}\n"
+            )
+
+    print_plan(plan, cwd, apply=args.apply, verbose=args.verbose, stdout=stdout)
+    unmatched = sum(1 for a in plan.skipped if a.kind == "skip_unmatched")
+    print_summary(
+        plan,
+        failed,
+        apply=args.apply,
+        unmatched_verbose=unmatched if args.verbose else 0,
+        stdout=stdout,
+    )
+
+    if failed:
+        return EXIT_PARTIAL
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\naborted: interrupted\n")
+        sys.exit(EXIT_USAGE)

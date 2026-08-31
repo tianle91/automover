@@ -1,0 +1,679 @@
+from __future__ import annotations
+
+import io
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import automover  # noqa: E402
+
+
+class TtyIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+SAMPLE = """\
+# sample automover config
+photos:
+  target_path: pictures
+  move_targets:
+    files: true
+    folders: false
+  keywords:
+    - IMG_
+    - photo
+docs:
+  target_path: documents
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+    - report
+"""
+
+
+def write_tree(files: dict[str, str | None]) -> tempfile.TemporaryDirectory:
+    """Create a temp dir. Value None means a directory; str means file contents."""
+    tmp = tempfile.TemporaryDirectory()
+    root = Path(tmp.name)
+    for rel, content in files.items():
+        path = root / rel
+        if content is None:
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+    return tmp
+
+
+def run(
+    cwd: Path,
+    argv: list[str],
+    stdin_text: str = "",
+    tty: bool = False,
+) -> tuple[int, str, str]:
+    stdin: io.StringIO = TtyIO(stdin_text) if tty else io.StringIO(stdin_text)
+    stdout = TtyIO() if tty else io.StringIO()
+    stderr = io.StringIO()
+    code = automover.main(
+        ["--cwd", str(cwd), *argv],
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+class YamlLoaderTests(unittest.TestCase):
+    def test_parses_comments_and_booleans(self):
+        data = automover.load_simple_yaml(SAMPLE)
+        self.assertEqual(set(data), {"photos", "docs"})
+        self.assertTrue(data["photos"]["move_targets"]["files"])
+        self.assertFalse(data["photos"]["move_targets"]["folders"])
+        self.assertEqual(data["docs"]["keywords"], ["invoice", "report"])
+
+    def test_quoted_strings_and_inline_comments(self):
+        text = """\
+group:
+  target_path: "my folder"  # comment
+  move_targets:
+    files: true
+    folders: false
+  keywords:
+    - "hello world"
+    - plain
+"""
+        data = automover.load_simple_yaml(text)
+        self.assertEqual(data["group"]["target_path"], "my folder")
+        self.assertEqual(data["group"]["keywords"][0], "hello world")
+
+    def test_rejects_tabs(self):
+        with self.assertRaises(automover.ConfigError) as ctx:
+            automover.load_simple_yaml("group:\n\ttarget_path: x\n")
+        self.assertIn("tabs", str(ctx.exception))
+
+    def test_rejects_duplicate_keys(self):
+        with self.assertRaises(automover.ConfigError):
+            automover.load_simple_yaml("a: 1\na: 2\n")
+
+    def test_empty_file(self):
+        with self.assertRaises(automover.ConfigError):
+            automover.load_simple_yaml("\n# only comments\n")
+
+
+class SchemaTests(unittest.TestCase):
+    def test_validate_ok(self):
+        with write_tree({"automover.yaml": SAMPLE}) as name:
+            cwd = Path(name)
+            groups = automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertEqual([g.name for g in groups], ["photos", "docs"])
+            self.assertEqual(groups[0].target, (cwd / "pictures").resolve())
+
+    def test_unknown_key(self):
+        text = SAMPLE.replace("  keywords:", "  extra: 1\n  keywords:")
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("unknown keys", str(ctx.exception))
+
+    def test_both_move_targets_false(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: false
+    folders: false
+  keywords:
+    - x
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("cannot both be false", str(ctx.exception))
+
+    def test_empty_keywords(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+  keywords: []
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError):
+                automover.load_config(cwd / "automover.yaml", cwd)
+
+    def test_target_escapes_cwd(self):
+        text = """\
+g:
+  target_path: ../outside
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - x
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("escapes", str(ctx.exception))
+
+    def test_target_is_cwd(self):
+        text = """\
+g:
+  target_path: .
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - x
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("working directory", str(ctx.exception))
+
+    def test_absolute_target(self):
+        text = """\
+g:
+  target_path: /tmp/out
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - x
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("relative", str(ctx.exception))
+
+    def test_target_exists_as_file(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - x
+"""
+        with write_tree({"automover.yaml": text, "out": "not a dir"}) as name:
+            cwd = Path(name)
+            with self.assertRaises(automover.ConfigError) as ctx:
+                automover.load_config(cwd / "automover.yaml", cwd)
+            self.assertIn("not a directory", str(ctx.exception))
+
+
+class FindConfigTests(unittest.TestCase):
+    def test_prefers_yaml_when_both_exist(self):
+        with write_tree(
+            {"automover.yaml": SAMPLE, "automover.yml": SAMPLE}
+        ) as name:
+            warnings: list[str] = []
+            path = automover.find_config(Path(name), None, warnings.append)
+            self.assertTrue(path.name.endswith("automover.yaml"))
+            self.assertTrue(warnings)
+
+    def test_accepts_yml(self):
+        with write_tree({"automover.yml": SAMPLE}) as name:
+            path = automover.find_config(Path(name), None, lambda m: None)
+            self.assertTrue(path.name.endswith("automover.yml"))
+
+    def test_missing(self):
+        with write_tree({}) as name:
+            with self.assertRaises(automover.ConfigError):
+                automover.find_config(Path(name), None, lambda m: None)
+
+
+class MatchTests(unittest.TestCase):
+    def test_substring_case_sensitive(self):
+        with write_tree({"automover.yaml": SAMPLE}) as name:
+            groups = automover.load_config(Path(name) / "automover.yaml", Path(name))
+        hits = automover.matching_groups("IMG_1234.jpg", "file", groups)
+        self.assertEqual([h.group.name for h in hits], ["photos"])
+        self.assertEqual(hits[0].keyword, "IMG_")
+
+        self.assertEqual(automover.matching_groups("img_1234.jpg", "file", groups), [])
+
+    def test_type_filter(self):
+        with write_tree({"automover.yaml": SAMPLE}) as name:
+            groups = automover.load_config(Path(name) / "automover.yaml", Path(name))
+        # photos only moves files
+        self.assertEqual(automover.matching_groups("IMG_album", "dir", groups), [])
+        self.assertEqual(
+            [h.group.name for h in automover.matching_groups("IMG_album", "file", groups)],
+            ["photos"],
+        )
+
+    def test_overlap(self):
+        text = """\
+a:
+  target_path: a
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - draft
+b:
+  target_path: b
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            groups = automover.load_config(Path(name) / "automover.yaml", Path(name))
+        hits = automover.matching_groups("draft_invoice.pdf", "file", groups)
+        self.assertEqual([h.group.name for h in hits], ["a", "b"])
+
+
+class CliTests(unittest.TestCase):
+    def test_validate(self):
+        with write_tree({"automover.yaml": SAMPLE}) as name:
+            code, out, err = run(Path(name), ["--validate"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Config OK", out)
+
+    def test_dry_run_does_not_move(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "x",
+                "invoice.pdf": "y",
+                "notes.txt": "z",
+                "report_folder": None,
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, [])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Dry-run", out)
+            self.assertTrue((cwd / "IMG_1.jpg").is_file())
+            self.assertFalse((cwd / "pictures").exists())
+            self.assertIn("IMG_1.jpg -> pictures/IMG_1.jpg", out)
+            self.assertIn("invoice.pdf -> documents/invoice.pdf", out)
+            self.assertIn("report_folder -> documents/report_folder", out)
+            self.assertNotIn("notes.txt", out)
+
+    def test_apply_moves_files_and_folders(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "x",
+                "invoice.pdf": "y",
+                "report_folder/inside.txt": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertFalse((cwd / "IMG_1.jpg").exists())
+            self.assertTrue((cwd / "pictures" / "IMG_1.jpg").is_file())
+            self.assertTrue((cwd / "documents" / "invoice.pdf").is_file())
+            self.assertTrue((cwd / "documents" / "report_folder" / "inside.txt").is_file())
+            self.assertIn("Moved:", out)
+
+    def test_idempotent_second_run(self):
+        with write_tree(
+            {"automover.yaml": SAMPLE, "IMG_1.jpg": "x"}
+        ) as name:
+            cwd = Path(name)
+            self.assertEqual(run(cwd, ["--apply"])[0], 0)
+            code, out, err = run(cwd, ["--apply", "--verbose"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("0 moved", out)
+            self.assertTrue((cwd / "pictures" / "IMG_1.jpg").is_file())
+
+    def test_does_not_move_config_even_if_keyword_matches(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - automover
+"""
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--verbose"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "automover.yaml").is_file())
+            self.assertFalse((cwd / "out" / "automover.yaml").exists())
+
+    def test_skips_hidden(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - secret
+"""
+        with write_tree({"automover.yaml": text, ".secret.txt": "x"}) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--verbose"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / ".secret.txt").is_file())
+            self.assertIn("hidden", out)
+
+    def test_skips_target_directory(self):
+        with write_tree(
+            {"automover.yaml": SAMPLE, "pictures/keep.txt": "x"}
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--verbose"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "pictures" / "keep.txt").is_file())
+
+    def test_files_only_leaves_folders(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+  keywords:
+    - foo
+"""
+        with write_tree(
+            {"automover.yaml": text, "foo.txt": "a", "foo_dir": None}
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "out" / "foo.txt").is_file())
+            self.assertTrue((cwd / "foo_dir").is_dir())
+
+    def test_overlap_dry_run_reports_prompt(self):
+        text = """\
+a:
+  target_path: a
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - draft
+b:
+  target_path: b
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+"""
+        with write_tree(
+            {"automover.yaml": text, "draft_invoice.pdf": "x"}
+        ) as name:
+            code, out, err = run(Path(name), [])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Would prompt (multi-group overlap)", out)
+            self.assertTrue((Path(name) / "draft_invoice.pdf").is_file())
+
+    def test_overlap_first_group_wins(self):
+        text = """\
+a:
+  target_path: a
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - draft
+b:
+  target_path: b
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+"""
+        with write_tree(
+            {"automover.yaml": text, "draft_invoice.pdf": "x"}
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--first-group-wins"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "a" / "draft_invoice.pdf").is_file())
+            self.assertFalse((cwd / "b").exists() and any((cwd / "b").iterdir()))
+
+    def test_overlap_apply_without_tty_errors(self):
+        text = """\
+a:
+  target_path: a
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - draft
+b:
+  target_path: b
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+"""
+        with write_tree(
+            {"automover.yaml": text, "draft_invoice.pdf": "x"}
+        ) as name:
+            code, out, err = run(Path(name), ["--apply"])
+            self.assertEqual(code, 1)
+            self.assertIn("--first-group-wins", err)
+            self.assertTrue((Path(name) / "draft_invoice.pdf").is_file())
+
+    def test_overlap_prompt_choose_second_group(self):
+        text = """\
+a:
+  target_path: a
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - draft
+b:
+  target_path: b
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+"""
+        with write_tree(
+            {"automover.yaml": text, "draft_invoice.pdf": "x"}
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(
+                cwd, ["--apply"], stdin_text="2\n", tty=True
+            )
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue((cwd / "b" / "draft_invoice.pdf").is_file())
+            self.assertFalse((cwd / "a" / "draft_invoice.pdf").exists())
+
+    def test_conflict_dry_run(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, [])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Would prompt (destination exists", out)
+            self.assertEqual((cwd / "IMG_1.jpg").read_text(), "new")
+            self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
+
+    def test_conflict_skip_flag(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--skip-conflicts"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "IMG_1.jpg").is_file())
+            self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
+            self.assertIn("destination already exists", out)
+
+    def test_conflict_apply_without_tty_errors(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            code, out, err = run(Path(name), ["--apply"])
+            self.assertEqual(code, 1)
+            self.assertIn("--skip-conflicts", err)
+
+    def test_conflict_prompt_rename(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(
+                cwd, ["--apply"], stdin_text="r\n", tty=True
+            )
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse((cwd / "IMG_1.jpg").exists())
+            self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
+            self.assertEqual((cwd / "pictures" / "IMG_1 (1).jpg").read_text(), "new")
+            self.assertIn("renamed", out)
+
+    def test_conflict_prompt_skip(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(
+                cwd, ["--apply"], stdin_text="s\n", tty=True
+            )
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue((cwd / "IMG_1.jpg").is_file())
+            self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
+
+    def test_missing_config(self):
+        with write_tree({"file.txt": "x"}) as name:
+            code, out, err = run(Path(name), [])
+            self.assertEqual(code, 1)
+            self.assertIn("no automover.yaml", err)
+
+    def test_yml_extension(self):
+        with write_tree({"automover.yml": SAMPLE, "IMG_1.jpg": "x"}) as name:
+            code, out, err = run(Path(name), ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((Path(name) / "pictures" / "IMG_1.jpg").is_file())
+
+    def test_explicit_config(self):
+        with write_tree(
+            {"custom.yaml": SAMPLE, "IMG_1.jpg": "x"}
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--config", str(cwd / "custom.yaml")])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "pictures" / "IMG_1.jpg").is_file())
+
+    def test_user_abort_on_prompt(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            code, out, err = run(
+                Path(name), ["--apply"], stdin_text="q\n", tty=True
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("aborted", err)
+            self.assertTrue((Path(name) / "IMG_1.jpg").is_file())
+
+    def test_never_overwrites(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply", "--skip-conflicts"])
+            self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
+
+    def test_skips_symlink(self):
+        with write_tree({"automover.yaml": SAMPLE, "real_IMG.jpg": "x"}) as name:
+            cwd = Path(name)
+            link = cwd / "IMG_link.jpg"
+            os.symlink(cwd / "real_IMG.jpg", link)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue(link.is_symlink())
+            self.assertFalse((cwd / "pictures" / "IMG_link.jpg").exists())
+            self.assertIn("symlinks are not moved", out)
+
+    def test_substring_in_middle(self):
+        with write_tree(
+            {"automover.yaml": SAMPLE, "vacation_photo_1.png": "x"}
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "pictures" / "vacation_photo_1.png").is_file())
+
+    def test_nested_target_path_created(self):
+        text = """\
+g:
+  target_path: sorted/images
+  move_targets:
+    files: true
+    folders: false
+  keywords:
+    - IMG_
+"""
+        with write_tree({"automover.yaml": text, "IMG_2.jpg": "x"}) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "sorted" / "images" / "IMG_2.jpg").is_file())
+
+
+class UniqueNameTests(unittest.TestCase):
+    def test_increments(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name)
+            (parent / "file.txt").write_text("a")
+            (parent / "file (1).txt").write_text("b")
+            dest = automover.unique_destination(parent, "file.txt")
+            self.assertEqual(dest.name, "file (2).txt")
+
+
+if __name__ == "__main__":
+    unittest.main()

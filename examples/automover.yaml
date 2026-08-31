@@ -1,0 +1,36 @@
+# Example automover config. Copy to the folder you want to sort
+# as automover.yaml (or automover.yml), then:
+#
+#   python3 automover.py           # dry-run
+#   python3 automover.py --apply   # move
+#
+# Matching is a case-sensitive substring of each top-level basename.
+
+photos:
+  target_path: pictures
+  move_targets:
+    files: true
+    folders: false
+  keywords:
+    - IMG_
+    - photo
+    - DSC_
+
+documents:
+  target_path: documents
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - invoice
+    - report
+    - statement
+
+archives:
+  target_path: archives
+  move_targets:
+    files: true
+    folders: true
+  keywords:
+    - backup
+    - archive
