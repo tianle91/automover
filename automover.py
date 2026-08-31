@@ -1380,7 +1380,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="automover",
         description=(
             "Move top-level files and folders using automover.yaml. "
-            "Match on case-sensitive keyword substrings and/or file types. "
+            "Match on case-sensitive keyword substrings, globs, and/or file types. "
             "Default mode is dry-run. "
             "Use --prompt (or: prompt) to print an AI prompt for generating the YAML; "
             "automover does not call a model."
