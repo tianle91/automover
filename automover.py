@@ -2,6 +2,8 @@
 """Keyword-based file/folder mover driven by automover.yaml.
 
 Default mode is a dry-run. Pass --apply to move anything.
+Pass --prompt (or: prompt) to print an AI prompt for generating automover.yaml;
+the CLI does not call a model.
 
 Example config (automover.yaml or automover.yml):
 
@@ -28,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 CONFIG_NAMES = ("automover.yaml", "automover.yml")
 
 # Frozen, lowercase, leading-dot suffixes. Matching is case-insensitive.
@@ -848,6 +850,211 @@ def collect_candidates(
     return entries, skipped
 
 
+# ---------------------------------------------------------------------------
+# AI prompt for generating automover.yaml (no model is invoked)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InventoryItem:
+    name: str
+    kind: str
+    types: tuple[str, ...]
+
+
+@dataclass
+class Inventory:
+    files: list[InventoryItem] = field(default_factory=list)
+    folders: list[InventoryItem] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def guess_types(filename: str) -> tuple[str, ...]:
+    return tuple(
+        type_name
+        for type_name, exts in FILE_TYPES.items()
+        if name_has_extension(filename, exts)
+    )
+
+
+def list_inventory(cwd: Path) -> Inventory:
+    """Top-level files and folders automover would consider (no config required)."""
+    inventory = Inventory()
+    self_path = _self_path()
+    names_to_skip = set(CONFIG_NAMES)
+    try:
+        listed = sorted(cwd.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        raise ConfigError(f"could not list {cwd}: {exc}") from exc
+
+    for entry in listed:
+        name = entry.name
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            inventory.skipped.append((name, "unreadable"))
+            continue
+        if name in names_to_skip:
+            inventory.skipped.append((name, "config file"))
+            continue
+        if self_path is not None and resolved == self_path:
+            inventory.skipped.append((name, "automover script"))
+            continue
+        if name.startswith("."):
+            inventory.skipped.append((name, "hidden"))
+            continue
+        kind = classify_entry(entry)
+        if kind == "symlink":
+            inventory.skipped.append((name, "symlink"))
+            continue
+        if kind == "other":
+            inventory.skipped.append((name, "not a regular file or folder"))
+            continue
+        if kind == "dir":
+            inventory.folders.append(InventoryItem(name, "dir", ()))
+        else:
+            inventory.files.append(InventoryItem(name, "file", guess_types(name)))
+    return inventory
+
+
+def format_type_catalog() -> str:
+    lines = []
+    for type_name in FILE_TYPES:
+        exts = ", ".join(sorted(FILE_TYPES[type_name]))
+        lines.append(f"  {type_name}: {exts}")
+    return "\n".join(lines)
+
+
+def _format_inventory_section(inventory: Inventory) -> str:
+    lines: list[str] = []
+    lines.append(f"Files ({len(inventory.files)}):")
+    if inventory.files:
+        for item in inventory.files:
+            suffix = Path(item.name).suffix
+            type_note = ", ".join(item.types) if item.types else "untyped"
+            extra = f"  suffix={suffix}" if suffix else "  no suffix"
+            lines.append(f"  - {item.name}  [{type_note}]{extra}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+    lines.append(f"Folders ({len(inventory.folders)}):")
+    if inventory.folders:
+        for item in inventory.folders:
+            lines.append(f"  - {item.name}/")
+    else:
+        lines.append("  (none)")
+    if inventory.skipped:
+        lines.append("")
+        lines.append("Skipped by automover (do not target these):")
+        for name, reason in inventory.skipped:
+            lines.append(f"  - {name}  ({reason})")
+    return "\n".join(lines)
+
+
+def build_generation_prompt(
+    cwd: Path,
+    inventory: Inventory,
+    existing_yaml: Optional[str] = None,
+    existing_path: Optional[Path] = None,
+) -> str:
+    """Build a prompt an AI agent can use to write automover.yaml. Does not call a model."""
+    existing_block = ""
+    if existing_yaml is not None and existing_path is not None:
+        existing_block = (
+            "\n## Existing config\n"
+            f"A config already exists at {existing_path.name}. "
+            "Replace it with an improved file that still covers these items, "
+            "or keep groups that still make sense.\n\n"
+            "```yaml\n"
+            f"{existing_yaml.rstrip()}\n"
+            "```\n"
+        )
+
+    return f"""You are writing automover.yaml for the automover CLI.
+Do not move, copy, or delete files. Do not run automover. Output only the YAML file contents (no markdown fences, no commentary).
+
+## What automover does
+It scans only the top level of the working directory (no recursion) and moves matching files/folders into per-group target directories. Dry-run is the default; the user will run --apply later.
+
+## Schema
+Each top-level key is a group. Groups are tried in file order. First match can overlap; avoid overlap when you can.
+
+```yaml
+group_name:
+  target_path: relative/folder
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - image
+    extensions:
+      - heic
+  keywords:
+    - IMG_
+```
+
+Rules:
+- target_path must be a relative subdirectory of the working directory (not `.`, not absolute, no `..` escape).
+- move_targets.files and folders are required booleans; at least one must be true.
+- types is optional. Supported values only:
+{format_type_catalog()}
+- extensions is optional (jpg or .jpg). Unioned with types. Case-insensitive suffix match.
+- types/extensions apply to files only. folders: true requires keywords (folders ignore types).
+- keywords are optional only when files: true and types or extensions are set. They are case-sensitive substrings of the basename (not globs).
+- Do not invent types. Use extensions for suffixes that are not in the lists above.
+- Prefer types for media/document dumps; use keywords when names share a distinctive token.
+- Do not write groups that would match automover.yaml, hidden names, or symlinks.
+- Reuse existing destination folder names from the listing when they already look like sort buckets.
+- Indent nested lists under their keys (two spaces). Do not use same-indent lists.
+- Output must be parseable by automover's YAML subset: mappings, lists, booleans, # comments, quoted strings. No tabs, no flow lists like [a, b].
+
+## Working directory
+{cwd}
+
+## Top-level entries automover can move
+{_format_inventory_section(inventory)}
+{existing_block}
+## Your task
+Write a complete automover.yaml that sorts the listed entries into sensible groups. Cover as many entries as is reasonable without catch-all keywords so short they match everything. If the directory is already tidy or empty of movable entries, still emit a minimal valid config with a comment explaining that.
+"""
+
+
+def load_optional_config_text(
+    cwd: Path, explicit: Optional[Path]
+) -> tuple[Optional[Path], Optional[str]]:
+    try:
+        path = find_config(cwd, explicit, lambda _m: None)
+    except ConfigError:
+        if explicit is not None:
+            raise
+        return None, None
+    try:
+        return path, path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not read config {path}: {exc}") from exc
+
+
+def expand_prompt_command(argv: list[str]) -> list[str]:
+    """Turn a bare `prompt` token into --prompt (so `automover.py prompt` works)."""
+    flags_with_value = {"--cwd", "--config"}
+    out: list[str] = []
+    expecting_value = False
+    for tok in argv:
+        if expecting_value:
+            out.append(tok)
+            expecting_value = False
+            continue
+        if tok in flags_with_value:
+            out.append(tok)
+            expecting_value = True
+            continue
+        if tok == "prompt":
+            out.append("--prompt")
+            continue
+        out.append(tok)
+    return out
+
+
 def plan_moves(
     cwd: Path,
     entries: list[Path],
@@ -1113,7 +1320,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Move top-level files and folders using automover.yaml. "
             "Match on case-sensitive keyword substrings and/or file types. "
-            "Default mode is dry-run."
+            "Default mode is dry-run. "
+            "Use --prompt (or: prompt) to print an AI prompt for generating the YAML; "
+            "automover does not call a model."
         ),
     )
     parser.add_argument(
@@ -1148,6 +1357,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--prompt",
+        action="store_true",
+        help=(
+            "List top-level files and folders and print a prompt an AI agent can use "
+            "to generate automover.yaml. Does not call a model or move files. "
+            "Also accepted as: automover.py prompt"
+        ),
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="Validate the config file and exit without scanning.",
@@ -1177,7 +1395,8 @@ def main(
     stderr = stderr if stderr is not None else sys.stderr
 
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(expand_prompt_command(raw_argv))
 
     cwd = (args.cwd if args.cwd is not None else Path.cwd())
     try:
@@ -1191,6 +1410,26 @@ def main(
 
     def warn(message: str) -> None:
         stderr.write(f"warning: {message}\n")
+
+    if args.prompt:
+        if args.apply or args.validate:
+            stderr.write("error: --prompt cannot be combined with --apply or --validate\n")
+            return EXIT_USAGE
+        try:
+            inventory = list_inventory(cwd)
+            existing_path, existing_yaml = load_optional_config_text(cwd, args.config)
+        except ConfigError as exc:
+            stderr.write(f"error: {exc}\n")
+            return EXIT_USAGE
+        stdout.write(
+            build_generation_prompt(
+                cwd,
+                inventory,
+                existing_yaml=existing_yaml,
+                existing_path=existing_path,
+            )
+        )
+        return EXIT_OK
 
     try:
         config_path = find_config(cwd, args.config, warn)

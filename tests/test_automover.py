@@ -964,6 +964,79 @@ g:
             self.assertTrue((cwd / "out" / "album_dir").is_dir())
 
 
+class PromptTests(unittest.TestCase):
+    def test_prompt_does_not_require_config(self):
+        with write_tree({"vacation.jpg": "x", "clip.mp4": "y", "ProjectX": None}) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--prompt"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("vacation.jpg", out)
+            self.assertIn("[image]", out)
+            self.assertIn("clip.mp4", out)
+            self.assertIn("[video]", out)
+            self.assertIn("ProjectX/", out)
+            self.assertIn("Output only the YAML", out)
+            self.assertIn("types is optional", out)
+            self.assertIn("documents:", out)
+            self.assertNotIn("Existing config", out)
+            self.assertFalse((cwd / "automover.yaml").exists())
+
+    def test_prompt_subcommand_alias(self):
+        with write_tree({"notes.pdf": "x"}) as name:
+            code, out, err = run(Path(name), ["prompt"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("notes.pdf", out)
+            self.assertIn("[documents]", out)
+
+    def test_prompt_includes_existing_config(self):
+        with write_tree({"automover.yaml": SAMPLE, "IMG_1.jpg": "x"}) as name:
+            code, out, err = run(Path(name), ["--prompt"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Existing config", out)
+            self.assertIn("photos:", out)
+            self.assertIn("IMG_1.jpg", out)
+            self.assertIn("automover.yaml  (config file)", out)
+
+    def test_prompt_skips_hidden_and_symlinks(self):
+        with write_tree({"visible.txt": "x", ".secret": "y"}) as name:
+            cwd = Path(name)
+            os.symlink(cwd / "visible.txt", cwd / "link.txt")
+            code, out, err = run(cwd, ["--prompt"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("visible.txt", out)
+            self.assertIn(".secret  (hidden)", out)
+            self.assertIn("link.txt  (symlink)", out)
+
+    def test_prompt_rejects_apply(self):
+        with write_tree({"a.txt": "x"}) as name:
+            code, out, err = run(Path(name), ["--prompt", "--apply"])
+            self.assertEqual(code, 1)
+            self.assertIn("cannot be combined", err)
+
+    def test_prompt_explicit_missing_config_errors(self):
+        with write_tree({"a.txt": "x"}) as name:
+            code, out, err = run(
+                Path(name), ["--prompt", "--config", "missing.yaml"]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("config not found", err)
+
+    def test_guess_types(self):
+        self.assertEqual(automover.guess_types("a.JPG"), ("image",))
+        self.assertEqual(automover.guess_types("a.mp3"), ("audio",))
+        self.assertEqual(automover.guess_types("a.bin"), ())
+
+    def test_expand_prompt_command(self):
+        self.assertEqual(
+            automover.expand_prompt_command(["prompt", "--cwd", "/tmp"]),
+            ["--prompt", "--cwd", "/tmp"],
+        )
+        self.assertEqual(
+            automover.expand_prompt_command(["--cwd", "/tmp", "prompt"]),
+            ["--cwd", "/tmp", "--prompt"],
+        )
+
+
 class UniqueNameTests(unittest.TestCase):
     def test_increments(self):
         with tempfile.TemporaryDirectory() as name:

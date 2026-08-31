@@ -50,6 +50,7 @@ See `examples/automover.yaml` for a fuller sample.
 python3 automover.py              # dry-run: print the plan
 python3 automover.py --apply      # perform moves
 python3 automover.py --validate   # schema-check the config only
+python3 automover.py prompt       # print an AI prompt to generate automover.yaml
 python3 automover.py -v           # also list hidden/unmatched/config skips
 ```
 
@@ -62,8 +63,22 @@ Useful flags:
 | `--first-group-wins` | If an item matches multiple groups, use the first group in the YAML file instead of prompting. |
 | `--config PATH` | Use a config file other than `automover.yaml` / `automover.yml`. |
 | `--cwd PATH` | Scan a different working directory. |
+| `--prompt` | Print a prompt an AI agent can use to generate `automover.yaml` from the top-level listing. Does not call a model. Same as `automover.py prompt`. |
 
 If both `automover.yaml` and `automover.yml` exist, `.yaml` is used and a warning is printed.
+
+## Generating a config with an AI agent
+
+`prompt` does not run a model. It lists every top-level file and folder automover would consider (plus guessed `image` / `audio` / `video` / `documents` types) and prints a filled-in schema prompt to stdout. Pipe or paste that into an agent, then save the YAML it returns as `automover.yaml`.
+
+```bash
+python3 automover.py prompt > /tmp/automover-prompt.txt
+# ...ask an agent to write automover.yaml from that prompt...
+python3 automover.py --validate
+python3 automover.py            # dry-run the generated config
+```
+
+If a config already exists, it is included so the agent can revise it. Hidden names, the config file, this script, and symlinks are listed as skipped.
 
 ## Matching rules (v1)
 
