@@ -97,3 +97,5 @@ Python 3.8+ standard library only. No packages to install.
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+Pull requests and pushes to `main` run that same command on GitHub Actions (Python 3.9 and 3.12).
