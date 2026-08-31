@@ -1116,6 +1116,21 @@ def expand_prompt_command(argv: list[str]) -> list[str]:
     return out
 
 
+def warn_catchall_globs(
+    groups: list[Group],
+    names: list[str],
+    warn: Callable[[str], None],
+) -> None:
+    if len(names) < 2:
+        return
+    for group in groups:
+        for pattern in group.globs:
+            if all(fnmatch.fnmatchcase(name, pattern) for name in names):
+                warn(
+                    f"group {group.name!r}: glob {pattern!r} matches every listed name"
+                )
+
+
 def plan_moves(
     cwd: Path,
     entries: list[Path],
@@ -1512,6 +1527,7 @@ def main(
         entries, early_skipped = collect_candidates(
             cwd, config_path, groups, verbose=args.verbose
         )
+        warn_catchall_globs(groups, [e.name for e in entries], warn)
         plan = plan_moves(
             cwd,
             entries,

@@ -25,6 +25,10 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 - `video` no longer includes `.ts` (TypeScript collision). Use `.m2ts` / `.mts` or `extensions`.
 - Documented that `documents` includes `.txt` / `.md` / `.csv`, and that the runtime is Python 3.9+.
 
+### Fixed
+
+- Removed duplicate `media` / `documents` / `archives` groups from `examples/automover.yaml`.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added

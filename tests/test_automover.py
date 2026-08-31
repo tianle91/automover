@@ -128,6 +128,19 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual([g.name for g in groups], ["photos", "docs"])
             self.assertEqual(groups[0].target, (cwd / "pictures").resolve())
 
+    def test_shipped_example_loads(self):
+        example = ROOT / "examples" / "automover.yaml"
+        with tempfile.TemporaryDirectory() as name:
+            cwd = Path(name)
+            groups = automover.load_config(example, cwd)
+        self.assertEqual(
+            [g.name for g in groups],
+            ["photos", "media", "documents", "archives"],
+        )
+        photos = groups[0]
+        self.assertEqual(photos.globs, ("IMG_*", "DSC*"))
+        self.assertEqual(photos.types, ("image",))
+
     def test_unknown_key(self):
         text = SAMPLE.replace("  keywords:", "  extra: 1\n  keywords:")
         with write_tree({"automover.yaml": text}) as name:
@@ -1109,6 +1122,23 @@ g:
             run(cwd, ["--apply"])
             self.assertTrue((cwd / "app.ts").is_file())
             self.assertTrue((cwd / "out" / "clip.mp4").is_file())
+
+    def test_catchall_glob_warns(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: true
+  globs:
+    - "*"
+"""
+        with write_tree(
+            {"automover.yaml": text, "a.txt": "x", "b.txt": "y"}
+        ) as name:
+            code, out, err = run(Path(name), [])
+            self.assertEqual(code, 0, err)
+            self.assertIn("matches every listed name", err)
 
 
 class PromptTests(unittest.TestCase):
