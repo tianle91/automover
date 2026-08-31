@@ -30,7 +30,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
 
-VERSION = "0.3.0"
+_FALLBACK_VERSION = "0.3.0"
+
+
+def _load_version() -> str:
+    path = Path(__file__).resolve().parent / "VERSION"
+    try:
+        text = path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return _FALLBACK_VERSION
+    return text or _FALLBACK_VERSION
+
+
+VERSION = _load_version()
 CONFIG_NAMES = ("automover.yaml", "automover.yml")
 
 # Frozen, lowercase, leading-dot suffixes. Matching is case-insensitive.

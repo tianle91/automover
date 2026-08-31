@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import sys
@@ -1035,6 +1036,25 @@ class PromptTests(unittest.TestCase):
             automover.expand_prompt_command(["--cwd", "/tmp", "prompt"]),
             ["--cwd", "/tmp", "--prompt"],
         )
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_file_matches_module(self):
+        text = (ROOT / "VERSION").read_text(encoding="utf-8").splitlines()[0].strip()
+        self.assertEqual(automover.VERSION, text)
+        self.assertRegex(text, r"^\d+\.\d+\.\d+$")
+
+    def test_changelog_documents_current_version(self):
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{automover.VERSION}]", changelog)
+
+    def test_cli_version(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                automover.main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn(automover.VERSION, buf.getvalue())
 
 
 class UniqueNameTests(unittest.TestCase):

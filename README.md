@@ -4,6 +4,8 @@ A single-file CLI that reads `automover.yaml` (or `automover.yml`) in the curren
 
 Default mode is a **dry-run**. Nothing is moved until you pass `--apply`.
 
+Version is the single line in [`VERSION`](VERSION); `python3 automover.py --version` prints it. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Config
 
 ```yaml
@@ -51,6 +53,7 @@ python3 automover.py              # dry-run: print the plan
 python3 automover.py --apply      # perform moves
 python3 automover.py --validate   # schema-check the config only
 python3 automover.py prompt       # print an AI prompt to generate automover.yaml
+python3 automover.py --version    # print the version from VERSION
 python3 automover.py -v           # also list hidden/unmatched/config skips
 ```
 
