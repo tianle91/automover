@@ -18,12 +18,13 @@ some_example_group:
     types:          # optional: image, audio, video, documents
       - image
     extensions:     # optional extra suffixes (unioned with types)
-      - heic
+      - eml
   keywords:
-    # case sensitive substrings of the basename; optional if types/extensions are set
+    # case sensitive substrings of the basename; optional if types/extensions/globs are set
     - first_keyword
-    - second_keyword
-    - third_keyword
+  globs:
+    - "IMG_*"
+    - "report-????.*"
 ```
 
 Each top-level key is a group. Groups are tried in file order.
@@ -32,17 +33,18 @@ Each top-level key is a group. Groups are tried in file order.
 |---|---|
 | `target_path` | Destination directory, relative to the working directory. Created if needed. Must stay inside the working directory. |
 | `move_targets.files` / `folders` | Whether this group considers files, folders, or both. At least one must be true. |
-| `move_targets.types` | Optional file-type categories. Supported: `image`, `audio`, `video`, `documents`. |
-| `move_targets.extensions` | Optional suffix list (`jpg` or `.jpg`). Unioned with `types`. Case-insensitive. |
-| `keywords` | Case-sensitive **substrings** of the basename. Required if `folders: true`. Optional for files when `types` or `extensions` are set. |
+| `move_targets.types` | Optional file-type categories. Supported: `image`, `audio`, `video`, `documents`. `video` does not include `.ts` (TypeScript). `documents` includes office files and also `.txt` / `.md` / `.csv`, not HTML. |
+| `move_targets.extensions` | Optional suffix list (`jpg` or `.jpg`). Unioned with `types`. Matches the last suffix (`Path.suffix`), not the stem. Compound values like `tar.gz` match the trailing name. |
+| `keywords` | Case-sensitive **substrings** of the full basename. |
+| `globs` | Case-sensitive `fnmatch` patterns against the full basename (`IMG_*`, `*.jpg`). Keywords and globs are OR. |
 
-Type filters apply to **files only**. Folders still match on keywords.
+Type filters apply to **files only**. Folders still match on keywords or globs.
 
 A file matches when:
 
 1. `files: true`, and
-2. if `keywords` are set, the basename contains at least one keyword, and
-3. if `types` and/or `extensions` are set, the suffix is in that allow-list
+2. if `keywords` and/or `globs` are set, the basename hits at least one of them, and
+3. if `types` and/or `extensions` are set, the last suffix is in that allow-list
 
 See `examples/automover.yaml` for a fuller sample.
 
@@ -86,9 +88,9 @@ If a config already exists, it is included so the agent can revise it. Hidden na
 ## Matching rules (v1)
 
 - Scans **only the top level** of the working directory (no recursion).
-- Keyword match is a case-sensitive substring of the **basename**.
-- Multiple keywords in one group are OR. `types` and `extensions` together are OR (union). Keywords **and** the type filter are AND.
-- Suffix matching is case-insensitive (`Photo.JPG` is an image). `tar.gz` is matched as a suffix of the name.
+- Keyword match is a case-sensitive substring of the **basename**. Glob match is case-sensitive `fnmatch` on the same basename (not the stem), so `IMG_*` and `*.jpg` both work.
+- Multiple keywords/globs in one group are OR. `types` and `extensions` together are OR (union). Name matchers **and** the type filter are AND.
+- Extensions use the last suffix (`Path.suffix`), not the stem. `Photo.JPG` is an image. `tar.gz` is matched as a trailing compound suffix.
 - Hidden names (starting with `.`), the config file, each group's target directory, and symlinks are skipped.
 - Re-running is idempotent: items already inside a target folder are not scanned.
 
@@ -110,7 +112,7 @@ Dry-run reports these as “would prompt” unless the corresponding flag is pas
 
 ## Requirements
 
-Python 3.8+ standard library only. No packages to install.
+Python 3.9+ standard library only. No packages to install.
 
 ```bash
 python3 -m unittest discover -s tests

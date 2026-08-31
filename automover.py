@@ -24,6 +24,7 @@ Example config (automover.yaml or automover.yml):
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -116,7 +117,6 @@ FILE_TYPES: dict[str, frozenset[str]] = {
             ".ogv",
             ".mts",
             ".m2ts",
-            ".ts",
             ".vob",
             ".m2v",
             ".asf",
@@ -286,11 +286,19 @@ def _parse_mapping(
         if has_inline:
             result[key] = _parse_scalar(inline)
             continue
-        if idx >= len(lines) or lines[idx][1] <= indent:
+        if idx >= len(lines) or lines[idx][1] < indent:
             result[key] = None
             continue
-        child_indent = lines[idx][1]
-        value, idx = _parse_value(lines, idx, child_indent)
+        next_indent = lines[idx][1]
+        next_content = lines[idx][2]
+        if next_indent == indent and (next_content == "-" or next_content.startswith("- ")):
+            value, idx = _parse_sequence(lines, idx, indent)
+            result[key] = value
+            continue
+        if next_indent <= indent:
+            result[key] = None
+            continue
+        value, idx = _parse_value(lines, idx, next_indent)
         result[key] = value
     return result, idx
 
@@ -344,7 +352,7 @@ def load_simple_yaml(text: str) -> Any:
 # ---------------------------------------------------------------------------
 
 REQUIRED_GROUP_KEYS = frozenset({"target_path", "move_targets"})
-OPTIONAL_GROUP_KEYS = frozenset({"keywords"})
+OPTIONAL_GROUP_KEYS = frozenset({"keywords", "globs"})
 GROUP_KEYS = REQUIRED_GROUP_KEYS | OPTIONAL_GROUP_KEYS
 
 REQUIRED_MOVE_TARGET_KEYS = frozenset({"files", "folders"})
@@ -366,8 +374,19 @@ def normalize_extension(raw: str) -> str:
 
 
 def name_has_extension(filename: str, extensions: Iterable[str]) -> bool:
+    """Match the last suffix (Path.suffix), not the stem.
+
+    Compound values like .tar.gz match a trailing suffix chain via endswith.
+    """
     lower = filename.lower()
-    return any(lower.endswith(ext) for ext in extensions)
+    suffix = Path(filename).suffix.lower()
+    for ext in extensions:
+        if ext.count(".") > 1:
+            if lower.endswith(ext):
+                return True
+        elif suffix == ext:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -378,14 +397,9 @@ class Group:
     move_files: bool
     move_folders: bool
     keywords: tuple[str, ...]
+    globs: tuple[str, ...]
     types: tuple[str, ...]
     extensions: tuple[str, ...]
-
-    def allowed_file_extensions(self) -> frozenset[str]:
-        allowed: set[str] = set(self.extensions)
-        for type_name in self.types:
-            allowed.update(FILE_TYPES[type_name])
-        return frozenset(allowed)
 
 
 def _parse_unique_strings(value: Any, *, field: str, group_name: str) -> list[str]:
@@ -409,6 +423,12 @@ def _parse_keywords(value: Any, *, group_name: str) -> list[str]:
     if value is None:
         return []
     return _parse_unique_strings(value, field="keywords", group_name=group_name)
+
+
+def _parse_globs(value: Any, *, group_name: str) -> list[str]:
+    if value is None:
+        return []
+    return _parse_unique_strings(value, field="globs", group_name=group_name)
 
 
 def _parse_types(value: Any, *, group_name: str) -> list[str]:
@@ -518,14 +538,21 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
             )
 
         parsed_keywords = _parse_keywords(body.get("keywords"), group_name=name)
-        if move_folders and not parsed_keywords:
+        parsed_globs = _parse_globs(body.get("globs"), group_name=name)
+        name_matchers = bool(parsed_keywords or parsed_globs)
+        if move_folders and not name_matchers:
             raise ConfigError(
-                f"group {name!r}: folders: true requires keywords "
+                f"group {name!r}: folders: true requires keywords or globs "
                 "(types/extensions only apply to files)"
             )
-        if move_files and not parsed_keywords and not parsed_types and not parsed_extensions:
+        if (
+            move_files
+            and not name_matchers
+            and not parsed_types
+            and not parsed_extensions
+        ):
             raise ConfigError(
-                f"group {name!r}: files: true requires keywords, types, or extensions"
+                f"group {name!r}: files: true requires keywords, globs, types, or extensions"
             )
 
         groups.append(
@@ -536,6 +563,7 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
                 move_files=move_files,
                 move_folders=move_folders,
                 keywords=tuple(parsed_keywords),
+                globs=tuple(parsed_globs),
                 types=tuple(parsed_types),
                 extensions=tuple(parsed_extensions),
             )
@@ -655,6 +683,23 @@ def file_type_reason(name: str, group: Group) -> Optional[str]:
     return None
 
 
+def name_match_reason(name: str, group: Group) -> Optional[str]:
+    """How this basename hits keywords/globs.
+
+    Returns None if name matchers exist and none hit.
+    Returns "" if the group has no keywords or globs (type-only).
+    """
+    if not group.keywords and not group.globs:
+        return ""
+    for keyword in group.keywords:
+        if keyword in name:
+            return f"keyword: {keyword}"
+    for pattern in group.globs:
+        if fnmatch.fnmatchcase(name, pattern):
+            return f"glob: {pattern}"
+    return None
+
+
 def matching_groups(name: str, kind: str, groups: Iterable[Group]) -> list[Match]:
     hits: list[Match] = []
     for group in groups:
@@ -670,22 +715,20 @@ def matching_groups(name: str, kind: str, groups: Iterable[Group]) -> list[Match
                 continue
             type_reason = type_reason_or_miss
 
-        keyword_hit: Optional[str] = None
-        if group.keywords:
-            for keyword in group.keywords:
-                if keyword in name:
-                    keyword_hit = keyword
-                    break
-            else:
-                continue
-        elif kind != "file" or not type_reason:
+        name_reason = name_match_reason(name, group)
+        if name_reason is None:
+            continue
+        if not name_reason and (kind != "file" or not type_reason):
             continue
 
         parts: list[str] = []
-        if keyword_hit:
-            parts.append(f"keyword: {keyword_hit}")
+        if name_reason:
+            parts.append(name_reason)
         if type_reason:
             parts.append(type_reason)
+        keyword_hit: Optional[str] = None
+        if name_reason.startswith("keyword: "):
+            keyword_hit = name_reason[len("keyword: ") :]
         hits.append(
             Match(group=group, keyword=keyword_hit, reason=", ".join(parts))
         )
@@ -1000,9 +1043,12 @@ group_name:
     types:
       - image
     extensions:
-      - heic
+      - eml
   keywords:
     - IMG_
+  globs:
+    - "DSC*"
+    - "vacation-????.*"
 ```
 
 Rules:
@@ -1010,14 +1056,17 @@ Rules:
 - move_targets.files and folders are required booleans; at least one must be true.
 - types is optional. Supported values only:
 {format_type_catalog()}
-- extensions is optional (jpg or .jpg). Unioned with types. Case-insensitive suffix match.
-- types/extensions apply to files only. folders: true requires keywords (folders ignore types).
-- keywords are optional only when files: true and types or extensions are set. They are case-sensitive substrings of the basename (not globs).
-- Do not invent types. Use extensions for suffixes that are not in the lists above.
-- Prefer types for media/document dumps; use keywords when names share a distinctive token.
+- extensions is optional (jpg or .jpg). Unioned with types. Match the last suffix (Path.suffix), not the stem. Compound suffixes like tar.gz match the trailing name.
+- types/extensions apply to files only. folders: true requires keywords or globs.
+- keywords are case-sensitive substrings of the full basename (including extension).
+- globs are case-sensitive fnmatch patterns against the full basename (so IMG_* and *.jpg both work). Do not glob the stem; use extensions for suffix-only filters.
+- A group needs at least one of: keywords, globs, types, extensions. Name matchers (keywords/globs) are OR; the type/extension filter is AND with the name matchers.
+- Do not invent types. Use extensions for suffixes that are not in the lists above. video does not include .ts (TypeScript collision).
+- documents includes office files plus .txt/.md/.csv and similar text notes, not HTML.
+- Prefer types for media/document dumps; use globs for patterned names; use keywords for distinctive tokens.
 - Do not write groups that would match automover.yaml, hidden names, or symlinks.
 - Reuse existing destination folder names from the listing when they already look like sort buckets.
-- Indent nested lists under their keys (two spaces). Do not use same-indent lists.
+- Nested lists may be indented under their key, or placed at the same indent (both are valid).
 - Output must be parseable by automover's YAML subset: mappings, lists, booleans, # comments, quoted strings. No tabs, no flow lists like [a, b].
 
 ## Working directory

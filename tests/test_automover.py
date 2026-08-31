@@ -104,6 +104,17 @@ group:
         with self.assertRaises(automover.ConfigError):
             automover.load_simple_yaml("a: 1\na: 2\n")
 
+    def test_same_indent_lists(self):
+        text = """\
+group:
+  target_path: out
+  keywords:
+  - first
+  - second
+"""
+        data = automover.load_simple_yaml(text)
+        self.assertEqual(data["group"]["keywords"], ["first", "second"])
+
     def test_empty_file(self):
         with self.assertRaises(automover.ConfigError):
             automover.load_simple_yaml("\n# only comments\n")
@@ -217,7 +228,7 @@ g:
         with write_tree({"automover.yaml": text}) as name:
             with self.assertRaises(automover.ConfigError) as ctx:
                 automover.load_config(Path(name) / "automover.yaml", Path(name))
-            self.assertIn("folders: true requires keywords", str(ctx.exception))
+            self.assertIn("folders: true requires keywords or globs", str(ctx.exception))
 
     def test_files_require_some_matcher(self):
         text = """\
@@ -230,7 +241,7 @@ g:
         with write_tree({"automover.yaml": text}) as name:
             with self.assertRaises(automover.ConfigError) as ctx:
                 automover.load_config(Path(name) / "automover.yaml", Path(name))
-            self.assertIn("requires keywords, types, or extensions", str(ctx.exception))
+            self.assertIn("requires keywords, globs, types, or extensions", str(ctx.exception))
 
     def test_duplicate_extension_with_and_without_dot(self):
         text = """\
@@ -769,6 +780,7 @@ class TypeFilterTests(unittest.TestCase):
         self.assertIn(".jpg", automover.FILE_TYPES["image"])
         self.assertIn(".mp3", automover.FILE_TYPES["audio"])
         self.assertIn(".mp4", automover.FILE_TYPES["video"])
+        self.assertNotIn(".ts", automover.FILE_TYPES["video"])
 
     def test_type_only_moves_images(self):
         text = """\
@@ -963,6 +975,140 @@ g:
             self.assertTrue((cwd / "out" / "album.jpg").is_file())
             self.assertTrue((cwd / "album.txt").is_file())
             self.assertTrue((cwd / "out" / "album_dir").is_dir())
+
+
+class GlobAndExtensionTests(unittest.TestCase):
+    def test_glob_basename_not_stem(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+  globs:
+    - "IMG_*"
+    - "*.PDF"
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "IMG_1.jpg": "x",
+                "photo.jpg": "y",
+                "notes.PDF": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "out" / "IMG_1.jpg").is_file())
+            self.assertTrue((cwd / "photo.jpg").is_file())
+            self.assertTrue((cwd / "out" / "notes.PDF").is_file())
+            self.assertIn("glob: IMG_*", out)
+
+    def test_glob_case_sensitive_pattern(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+  globs:
+    - "*.jpg"
+"""
+        with write_tree(
+            {"automover.yaml": text, "a.jpg": "x", "b.JPG": "y"}
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "out" / "a.jpg").is_file())
+            self.assertTrue((cwd / "b.JPG").is_file())
+
+    def test_folders_may_use_globs_without_keywords(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: false
+    folders: true
+  globs:
+    - "album_*"
+"""
+        with write_tree(
+            {"automover.yaml": text, "album_one": None, "other": None}
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "out" / "album_one").is_dir())
+            self.assertTrue((cwd / "other").is_dir())
+
+    def test_keyword_or_glob(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+  keywords:
+    - invoice
+  globs:
+    - "scan-????.pdf"
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "invoice.pdf": "x",
+                "scan-2024.pdf": "y",
+                "other.pdf": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "out" / "invoice.pdf").is_file())
+            self.assertTrue((cwd / "out" / "scan-2024.pdf").is_file())
+            self.assertTrue((cwd / "other.pdf").is_file())
+
+    def test_extension_uses_last_suffix_not_stem(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+    extensions:
+      - jpg
+"""
+        with write_tree(
+            {
+                "automover.yaml": text,
+                "photo.jpg": "x",
+                "photo.jpg.exe": "y",
+                "jpg": "z",
+            }
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "out" / "photo.jpg").is_file())
+            self.assertTrue((cwd / "photo.jpg.exe").is_file())
+            self.assertTrue((cwd / "jpg").is_file())
+
+    def test_ts_is_not_video(self):
+        text = """\
+g:
+  target_path: out
+  move_targets:
+    files: true
+    folders: false
+    types:
+      - video
+"""
+        with write_tree(
+            {"automover.yaml": text, "app.ts": "x", "clip.mp4": "y"}
+        ) as name:
+            cwd = Path(name)
+            run(cwd, ["--apply"])
+            self.assertTrue((cwd / "app.ts").is_file())
+            self.assertTrue((cwd / "out" / "clip.mp4").is_file())
 
 
 class PromptTests(unittest.TestCase):

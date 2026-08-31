@@ -15,10 +15,15 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 - `prompt` / `--prompt` lists top-level files and folders and prints a prompt an AI agent can use to generate `automover.yaml`. The CLI does not call a model.
 - GitHub Actions CI running the stdlib unittest suite on Python 3.9 and 3.12.
+- Optional `globs` list: case-sensitive `fnmatch` against the full basename (`IMG_*`, `*.jpg`).
+- YAML subset loader accepts same-indent sequences (`keywords:` then `- item` at the same indent).
 
 ### Changed
 
 - Python bytecode caches are gitignored.
+- Extensions match `Path.suffix` (last suffix), not the stem and not a raw `endswith` on the whole name. Compound suffixes like `tar.gz` still match the trailing name.
+- `video` no longer includes `.ts` (TypeScript collision). Use `.m2ts` / `.mts` or `extensions`.
+- Documented that `documents` includes `.txt` / `.md` / `.csv`, and that the runtime is Python 3.9+.
 
 ## [0.2.0] - 2026-08-31
 
