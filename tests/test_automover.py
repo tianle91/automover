@@ -272,7 +272,7 @@ g:
                 automover.load_config(Path(name) / "automover.yaml", Path(name))
             self.assertIn("duplicate extension", str(ctx.exception))
 
-    def test_target_escapes_cwd(self):
+    def test_external_target_is_allowed_and_warned(self):
         text = """\
 g:
   target_path: ../outside
@@ -284,9 +284,10 @@ g:
 """
         with write_tree({"automover.yaml": text}) as name:
             cwd = Path(name)
-            with self.assertRaises(automover.ConfigError) as ctx:
-                automover.load_config(cwd / "automover.yaml", cwd)
-            self.assertIn("escapes", str(ctx.exception))
+            warnings: list[str] = []
+            groups = automover.load_config(cwd / "automover.yaml", cwd, warnings.append)
+            self.assertEqual(groups[0].target, (cwd / "../outside").resolve())
+            self.assertIn("outside the working directory", warnings[0])
 
     def test_target_is_cwd(self):
         text = """\
@@ -402,6 +403,28 @@ b:
 
 
 class CliTests(unittest.TestCase):
+    def test_external_target_warning_can_be_suppressed(self):
+        text = SAMPLE.replace("target_path: pictures", "target_path: ../pictures")
+        with write_tree({"automover.yaml": text}) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--validate"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("outside the working directory", err)
+
+            code, out, err = run(cwd, ["--validate", "--no-warn-external-targets"])
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("outside the working directory", err)
+
+    def test_apply_moves_to_external_target(self):
+        text = SAMPLE.replace("target_path: pictures", "target_path: ../pictures")
+        with write_tree({"automover.yaml": text, "IMG_1.jpg": "x"}) as name:
+            cwd = Path(name)
+            target = cwd.parent / "pictures"
+            code, out, err = run(cwd, ["--apply", "--no-warn-external-targets"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((target / "IMG_1.jpg").is_file())
+            self.assertFalse((cwd / "IMG_1.jpg").exists())
+
     def test_validate(self):
         with write_tree({"automover.yaml": SAMPLE}) as name:
             code, out, err = run(Path(name), ["--validate"])

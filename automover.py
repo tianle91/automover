@@ -467,7 +467,9 @@ def _parse_extensions(value: Any, *, group_name: str) -> list[str]:
     return parsed
 
 
-def validate_groups(data: Any, cwd: Path) -> list[Group]:
+def validate_groups(
+    data: Any, cwd: Path, warn: Optional[Callable[[str], None]] = None
+) -> list[Group]:
     if not isinstance(data, dict) or not data:
         raise ConfigError("config root must be a non-empty mapping of group names")
 
@@ -498,7 +500,12 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
                 f"group {name!r}: target_path must be relative, not {target_path!r}"
             )
 
-        target = _resolve_inside_cwd(cwd, target_path, group_name=name)
+        target, is_external = _resolve_target_path(cwd, target_path, group_name=name)
+        if is_external and warn is not None:
+            warn(
+                f"group {name!r}: target_path {target_path!r} is outside the "
+                "working directory"
+            )
         if target.exists() and not target.is_dir():
             raise ConfigError(
                 f"group {name!r}: target_path {target_path!r} exists and is not a directory"
@@ -571,21 +578,22 @@ def validate_groups(data: Any, cwd: Path) -> list[Group]:
     return groups
 
 
-def _resolve_inside_cwd(cwd: Path, target_path: str, group_name: str) -> Path:
+def _resolve_target_path(
+    cwd: Path, target_path: str, group_name: str
+) -> tuple[Path, bool]:
     cwd_r = cwd.resolve()
     resolved = (cwd / target_path).resolve()
     try:
         resolved.relative_to(cwd_r)
-    except ValueError as exc:
-        raise ConfigError(
-            f"group {group_name!r}: target_path {target_path!r} escapes the working directory"
-        ) from exc
+        is_external = False
+    except ValueError:
+        is_external = True
     if resolved == cwd_r:
         raise ConfigError(
             f"group {group_name!r}: target_path {target_path!r} must be a subdirectory, "
             "not the working directory"
         )
-    return resolved
+    return resolved, is_external
 
 
 def find_config(cwd: Path, explicit: Optional[Path], warn: Callable[[str], None]) -> Path:
@@ -612,7 +620,9 @@ def find_config(cwd: Path, explicit: Optional[Path], warn: Callable[[str], None]
     )
 
 
-def load_config(path: Path, cwd: Path) -> list[Group]:
+def load_config(
+    path: Path, cwd: Path, warn: Optional[Callable[[str], None]] = None
+) -> list[Group]:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -621,7 +631,7 @@ def load_config(path: Path, cwd: Path) -> list[Group]:
         data = load_simple_yaml(text)
     except ConfigError as exc:
         raise ConfigError(f"{path}: {exc}") from exc
-    return validate_groups(data, cwd)
+    return validate_groups(data, cwd, warn)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,7 +1062,7 @@ group_name:
 ```
 
 Rules:
-- target_path must be a relative subdirectory of the working directory (not `.`, not absolute, no `..` escape).
+- target_path must be relative and cannot be `.` or an absolute path. It may use `..` to target a directory outside the working directory; automover warns about that by default.
 - move_targets.files and folders are required booleans; at least one must be true.
 - types is optional. Supported values only:
 {format_type_catalog()}
@@ -1417,6 +1427,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Working directory to scan (default: current directory)",
     )
     parser.add_argument(
+        "--no-warn-external-targets",
+        action="store_true",
+        help="Do not warn when a relative target_path resolves outside the working directory.",
+    )
+    parser.add_argument(
         "--skip-conflicts",
         action="store_true",
         help=(
@@ -1509,7 +1524,11 @@ def main(
 
     try:
         config_path = find_config(cwd, args.config, warn)
-        groups = load_config(config_path, cwd)
+        groups = load_config(
+            config_path,
+            cwd,
+            None if args.no_warn_external_targets else warn,
+        )
     except ConfigError as exc:
         stderr.write(f"error: {exc}\n")
         return EXIT_USAGE
