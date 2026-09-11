@@ -468,7 +468,10 @@ def _parse_extensions(value: Any, *, group_name: str) -> list[str]:
 
 
 def validate_groups(
-    data: Any, cwd: Path, warn: Optional[Callable[[str], None]] = None
+    data: Any,
+    scan_path: Path,
+    warn: Optional[Callable[[str], None]] = None,
+    target_base: Optional[Path] = None,
 ) -> list[Group]:
     if not isinstance(data, dict) or not data:
         raise ConfigError("config root must be a non-empty mapping of group names")
@@ -500,7 +503,12 @@ def validate_groups(
                 f"group {name!r}: target_path must be relative, not {target_path!r}"
             )
 
-        target, is_external = _resolve_target_path(cwd, target_path, group_name=name)
+        target, is_external = _resolve_target_path(
+            target_base if target_base is not None else scan_path,
+            scan_path,
+            target_path,
+            group_name=name,
+        )
         if is_external and warn is not None:
             warn(
                 f"group {name!r}: target_path {target_path!r} is outside the "
@@ -579,19 +587,20 @@ def validate_groups(
 
 
 def _resolve_target_path(
-    cwd: Path, target_path: str, group_name: str
+    target_base: Path, scan_path: Path, target_path: str, group_name: str
 ) -> tuple[Path, bool]:
-    cwd_r = cwd.resolve()
-    resolved = (cwd / target_path).resolve()
+    target_base_r = target_base.resolve()
+    scan_path_r = scan_path.resolve()
+    resolved = (target_base_r / target_path).resolve()
     try:
-        resolved.relative_to(cwd_r)
+        resolved.relative_to(scan_path_r)
         is_external = False
     except ValueError:
         is_external = True
-    if resolved == cwd_r:
+    if resolved == target_base_r or resolved == scan_path_r:
         raise ConfigError(
             f"group {group_name!r}: target_path {target_path!r} must be a subdirectory, "
-            "not the scan path"
+            "not the scan path or config directory"
         )
     return resolved, is_external
 
@@ -633,7 +642,7 @@ def load_config(
         data = load_simple_yaml(text)
     except ConfigError as exc:
         raise ConfigError(f"{path}: {exc}") from exc
-    return validate_groups(data, cwd, warn)
+    return validate_groups(data, cwd, warn, target_base=path.resolve().parent)
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1073,7 @@ group_name:
 ```
 
 Rules:
-- target_path must be relative and cannot be `.` or an absolute path. It may use `..` to target a directory outside the scan path; automover warns about that by default.
+- target_path is resolved from the directory containing the config file. It must be relative and cannot be `.` or an absolute path. It may use `..` to target a directory outside the scan path; automover warns about that by default.
 - move_targets.files and folders are required booleans; at least one must be true.
 - types is optional. Supported values only:
 {format_type_catalog()}

@@ -31,7 +31,7 @@ Each top-level key is a group. Groups are tried in file order.
 
 | Field | Meaning |
 |---|---|
-| `target_path` | Destination directory, relative to the scan path. Created if needed. It may resolve outside the scan path (for example, `../sorted`); this emits a warning by default. |
+| `target_path` | Destination directory, relative to the directory containing the config file. Created if needed. If it resolves outside the scan path, this emits a warning by default. |
 | `move_targets.files` / `folders` | Whether this group considers files, folders, or both. At least one must be true. |
 | `move_targets.types` | Optional file-type categories. Supported: `image`, `audio`, `video`, `documents`. `video` does not include `.ts` (TypeScript). `documents` includes office files and also `.txt` / `.md` / `.csv`, not HTML. |
 | `move_targets.extensions` | Optional suffix list (`jpg` or `.jpg`). Unioned with `types`. Matches the last suffix (`Path.suffix`), not the stem. Compound values like `tar.gz` match the trailing name. |
@@ -95,7 +95,7 @@ If a config already exists, it is included so the agent can revise it. Hidden na
 - Keyword match is a case-sensitive substring of the **basename**. Glob match is case-sensitive `fnmatch` on the same basename (not the stem), so `IMG_*` and `*.jpg` both work.
 - Multiple keywords/globs in one group are OR. `types` and `extensions` together are OR (union). Name matchers **and** the type filter are AND.
 - Extensions use the last suffix (`Path.suffix`), not the stem. `Photo.JPG` is an image. `tar.gz` is matched as a trailing compound suffix.
-- Hidden names (starting with `.`), the config file, each target directory inside the scan path, and symlinks are skipped. Relative targets outside the scan path are supported and emit a warning unless `--no-warn-external-targets` is used.
+- Hidden names (starting with `.`), the config file, each target directory inside the scan path, and symlinks are skipped. Targets are resolved relative to the config file's directory; targets outside the scan path are supported and emit a warning unless `--no-warn-external-targets` is used.
 - Re-running is idempotent: items already inside a target folder are not scanned.
 
 ## Conflicts and overlaps
