@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -59,16 +60,22 @@ def run(
     argv: list[str],
     stdin_text: str = "",
     tty: bool = False,
+    config_dir: Optional[Path] = None,
 ) -> tuple[int, str, str]:
     stdin: io.StringIO = TtyIO(stdin_text) if tty else io.StringIO(stdin_text)
     stdout = TtyIO() if tty else io.StringIO()
     stderr = io.StringIO()
-    code = automover.main(
-        ["--cwd", str(cwd), *argv],
-        stdin=stdin,
-        stdout=stdout,
-        stderr=stderr,
-    )
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(config_dir if config_dir is not None else cwd)
+        code = automover.main(
+            ["--scan-path", str(cwd), *argv],
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    finally:
+        os.chdir(original_cwd)
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -287,7 +294,7 @@ g:
             warnings: list[str] = []
             groups = automover.load_config(cwd / "automover.yaml", cwd, warnings.append)
             self.assertEqual(groups[0].target, (cwd / "../outside").resolve())
-            self.assertIn("outside the working directory", warnings[0])
+            self.assertIn("outside the scan path", warnings[0])
 
     def test_target_is_cwd(self):
         text = """\
@@ -303,7 +310,7 @@ g:
             cwd = Path(name)
             with self.assertRaises(automover.ConfigError) as ctx:
                 automover.load_config(cwd / "automover.yaml", cwd)
-            self.assertIn("working directory", str(ctx.exception))
+            self.assertIn("scan path", str(ctx.exception))
 
     def test_absolute_target(self):
         text = """\
@@ -403,24 +410,62 @@ b:
 
 
 class CliTests(unittest.TestCase):
+    def test_scan_path_loads_config_from_current_directory(self):
+        with write_tree({"automover.yaml": SAMPLE}) as config_name:
+            with write_tree({"IMG_1.jpg": "x"}) as scan_name:
+                config_dir = Path(config_name)
+                scan_path = Path(scan_name)
+                code, out, err = run(
+                    scan_path, ["--apply"], config_dir=config_dir
+                )
+                self.assertEqual(code, 0, err)
+                self.assertIn(
+                    f"Config: {(config_dir / 'automover.yaml').resolve()}", out
+                )
+                self.assertIn(f"Scan path: {scan_path.resolve()}", out)
+                self.assertTrue((scan_path / "pictures" / "IMG_1.jpg").is_file())
+
+    def test_relative_config_is_resolved_from_current_directory(self):
+        with write_tree({"configs/custom.yaml": SAMPLE}) as config_name:
+            with write_tree({"IMG_1.jpg": "x"}) as scan_name:
+                config_dir = Path(config_name)
+                scan_path = Path(scan_name)
+                code, out, err = run(
+                    scan_path,
+                    ["--apply", "--config", "configs/custom.yaml"],
+                    config_dir=config_dir,
+                )
+                self.assertEqual(code, 0, err)
+                self.assertIn(
+                    f"Config: {(config_dir / 'configs/custom.yaml').resolve()}",
+                    out,
+                )
+                self.assertTrue((scan_path / "pictures" / "IMG_1.jpg").is_file())
+
     def test_external_target_warning_can_be_suppressed(self):
         text = SAMPLE.replace("target_path: pictures", "target_path: ../pictures")
         with write_tree({"automover.yaml": text}) as name:
             cwd = Path(name)
             code, out, err = run(cwd, ["--validate"])
             self.assertEqual(code, 0, err)
-            self.assertIn("outside the working directory", err)
+            self.assertIn("outside the scan path", err)
 
             code, out, err = run(cwd, ["--validate", "--no-warn-external-targets"])
             self.assertEqual(code, 0, err)
-            self.assertNotIn("outside the working directory", err)
+            self.assertNotIn("outside the scan path", err)
 
     def test_apply_moves_to_external_target(self):
         text = SAMPLE.replace("target_path: pictures", "target_path: ../pictures")
-        with write_tree({"automover.yaml": text, "IMG_1.jpg": "x"}) as name:
-            cwd = Path(name)
-            target = cwd.parent / "pictures"
-            code, out, err = run(cwd, ["--apply", "--no-warn-external-targets"])
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            cwd = root / "source"
+            cwd.mkdir()
+            (cwd / "automover.yaml").write_text(text, encoding="utf-8")
+            (cwd / "IMG_1.jpg").write_text("x", encoding="utf-8")
+            target = root / "pictures"
+            code, out, err = run(
+                cwd, ["--apply", "--no-warn-external-targets"]
+            )
             self.assertEqual(code, 0, err)
             self.assertTrue((target / "IMG_1.jpg").is_file())
             self.assertFalse((cwd / "IMG_1.jpg").exists())
@@ -1228,12 +1273,8 @@ class PromptTests(unittest.TestCase):
 
     def test_expand_prompt_command(self):
         self.assertEqual(
-            automover.expand_prompt_command(["prompt", "--cwd", "/tmp"]),
-            ["--prompt", "--cwd", "/tmp"],
-        )
-        self.assertEqual(
-            automover.expand_prompt_command(["--cwd", "/tmp", "prompt"]),
-            ["--cwd", "/tmp", "--prompt"],
+            automover.expand_prompt_command(["prompt", "--scan-path", "/tmp"]),
+            ["--prompt", "--scan-path", "/tmp"],
         )
 
 
