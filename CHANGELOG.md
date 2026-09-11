@@ -9,6 +9,10 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 ## [Unreleased]
 
+### Changed
+
+- Relative `target_path` values may now resolve outside the working directory. Automover warns for these cross-directory destinations by default; use `--no-warn-external-targets` to suppress the warning.
+
 ## [0.3.0] - 2026-08-31
 
 ### Added

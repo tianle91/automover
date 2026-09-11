@@ -31,7 +31,7 @@ Each top-level key is a group. Groups are tried in file order.
 
 | Field | Meaning |
 |---|---|
-| `target_path` | Destination directory, relative to the working directory. Created if needed. Must stay inside the working directory. |
+| `target_path` | Destination directory, relative to the working directory. Created if needed. It may resolve outside the working directory (for example, `../sorted`); this emits a warning by default. |
 | `move_targets.files` / `folders` | Whether this group considers files, folders, or both. At least one must be true. |
 | `move_targets.types` | Optional file-type categories. Supported: `image`, `audio`, `video`, `documents`. `video` does not include `.ts` (TypeScript). `documents` includes office files and also `.txt` / `.md` / `.csv`, not HTML. |
 | `move_targets.extensions` | Optional suffix list (`jpg` or `.jpg`). Unioned with `types`. Matches the last suffix (`Path.suffix`), not the stem. Compound values like `tar.gz` match the trailing name. |
@@ -68,6 +68,7 @@ Useful flags:
 | `--first-group-wins` | If an item matches multiple groups, use the first group in the YAML file instead of prompting. |
 | `--config PATH` | Use a config file other than `automover.yaml` / `automover.yml`. |
 | `--cwd PATH` | Scan a different working directory. |
+| `--no-warn-external-targets` | Suppress warnings for `target_path` values that resolve outside the working directory. |
 | `--prompt` | Print a prompt an AI agent can use to generate `automover.yaml` from the top-level listing. Does not call a model. Same as `automover.py prompt`. |
 
 If both `automover.yaml` and `automover.yml` exist, `.yaml` is used and a warning is printed.
@@ -91,7 +92,7 @@ If a config already exists, it is included so the agent can revise it. Hidden na
 - Keyword match is a case-sensitive substring of the **basename**. Glob match is case-sensitive `fnmatch` on the same basename (not the stem), so `IMG_*` and `*.jpg` both work.
 - Multiple keywords/globs in one group are OR. `types` and `extensions` together are OR (union). Name matchers **and** the type filter are AND.
 - Extensions use the last suffix (`Path.suffix`), not the stem. `Photo.JPG` is an image. `tar.gz` is matched as a trailing compound suffix.
-- Hidden names (starting with `.`), the config file, each group's target directory, and symlinks are skipped.
+- Hidden names (starting with `.`), the config file, each in-directory target directory, and symlinks are skipped. Relative targets outside the working directory are supported and emit a warning unless `--no-warn-external-targets` is used.
 - Re-running is idempotent: items already inside a target folder are not scanned.
 
 ## Conflicts and overlaps
