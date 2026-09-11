@@ -504,7 +504,7 @@ def validate_groups(
         if is_external and warn is not None:
             warn(
                 f"group {name!r}: target_path {target_path!r} is outside the "
-                "working directory"
+                "scan path"
             )
         if target.exists() and not target.is_dir():
             raise ConfigError(
@@ -591,20 +591,22 @@ def _resolve_target_path(
     if resolved == cwd_r:
         raise ConfigError(
             f"group {group_name!r}: target_path {target_path!r} must be a subdirectory, "
-            "not the working directory"
+            "not the scan path"
         )
     return resolved, is_external
 
 
-def find_config(cwd: Path, explicit: Optional[Path], warn: Callable[[str], None]) -> Path:
+def find_config(
+    config_dir: Path, explicit: Optional[Path], warn: Callable[[str], None]
+) -> Path:
     if explicit is not None:
-        path = explicit if explicit.is_absolute() else cwd / explicit
+        path = explicit if explicit.is_absolute() else config_dir / explicit
         if not path.is_file():
             raise ConfigError(f"config not found: {path}")
         return path.resolve()
 
-    yaml_path = cwd / "automover.yaml"
-    yml_path = cwd / "automover.yml"
+    yaml_path = config_dir / "automover.yaml"
+    yml_path = config_dir / "automover.yml"
     yaml_exists = yaml_path.is_file()
     yml_exists = yml_path.is_file()
     if yaml_exists and yml_exists:
@@ -615,7 +617,7 @@ def find_config(cwd: Path, explicit: Optional[Path], warn: Callable[[str], None]
     if yml_exists:
         return yml_path.resolve()
     raise ConfigError(
-        f"no automover.yaml or automover.yml in {cwd} "
+        f"no automover.yaml or automover.yml in {config_dir} "
         "(pass --config PATH to use another file)"
     )
 
@@ -1039,7 +1041,7 @@ def build_generation_prompt(
 Do not move, copy, or delete files. Do not run automover. Output only the YAML file contents (no markdown fences, no commentary).
 
 ## What automover does
-It scans only the top level of the working directory (no recursion) and moves matching files/folders into per-group target directories. Dry-run is the default; the user will run --apply later.
+It scans only the top level of the scan path (no recursion) and moves matching files/folders into per-group target directories. Dry-run is the default; the user will run --apply later.
 
 ## Schema
 Each top-level key is a group. Groups are tried in file order. First match can overlap; avoid overlap when you can.
@@ -1062,7 +1064,7 @@ group_name:
 ```
 
 Rules:
-- target_path must be relative and cannot be `.` or an absolute path. It may use `..` to target a directory outside the working directory; automover warns about that by default.
+- target_path must be relative and cannot be `.` or an absolute path. It may use `..` to target a directory outside the scan path; automover warns about that by default.
 - move_targets.files and folders are required booleans; at least one must be true.
 - types is optional. Supported values only:
 {format_type_catalog()}
@@ -1079,7 +1081,7 @@ Rules:
 - Nested lists may be indented under their key, or placed at the same indent (both are valid).
 - Output must be parseable by automover's YAML subset: mappings, lists, booleans, # comments, quoted strings. No tabs, no flow lists like [a, b].
 
-## Working directory
+## Scan path
 {cwd}
 
 ## Top-level entries automover can move
@@ -1107,7 +1109,7 @@ def load_optional_config_text(
 
 def expand_prompt_command(argv: list[str]) -> list[str]:
     """Turn a bare `prompt` token into --prompt (so `automover.py prompt` works)."""
-    flags_with_value = {"--cwd", "--config"}
+    flags_with_value = {"--scan-path", "--config"}
     out: list[str] = []
     expecting_value = False
     for tok in argv:
@@ -1419,17 +1421,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        help="Config file path (default: automover.yaml or automover.yml in the working directory)",
+        help="Config file path (default: automover.yaml or automover.yml in the current directory)",
     )
     parser.add_argument(
-        "--cwd",
+        "--scan-path",
+        dest="scan_path",
         type=Path,
-        help="Working directory to scan (default: current directory)",
+        help="Directory whose top-level entries are scanned and moved (default: current directory)",
     )
     parser.add_argument(
         "--no-warn-external-targets",
         action="store_true",
-        help="Do not warn when a relative target_path resolves outside the working directory.",
+        help="Do not warn when a relative target_path resolves outside the scan path.",
     )
     parser.add_argument(
         "--skip-conflicts",
@@ -1489,14 +1492,15 @@ def main(
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(expand_prompt_command(raw_argv))
 
-    cwd = (args.cwd if args.cwd is not None else Path.cwd())
+    config_dir = Path.cwd()
+    cwd = args.scan_path if args.scan_path is not None else config_dir
     try:
         cwd = cwd.resolve()
     except OSError as exc:
-        stderr.write(f"error: could not resolve working directory: {exc}\n")
+        stderr.write(f"error: could not resolve scan path: {exc}\n")
         return EXIT_USAGE
     if not cwd.is_dir():
-        stderr.write(f"error: working directory is not a directory: {cwd}\n")
+        stderr.write(f"error: scan path is not a directory: {cwd}\n")
         return EXIT_USAGE
 
     def warn(message: str) -> None:
@@ -1508,7 +1512,9 @@ def main(
             return EXIT_USAGE
         try:
             inventory = list_inventory(cwd)
-            existing_path, existing_yaml = load_optional_config_text(cwd, args.config)
+            existing_path, existing_yaml = load_optional_config_text(
+                config_dir, args.config
+            )
         except ConfigError as exc:
             stderr.write(f"error: {exc}\n")
             return EXIT_USAGE
@@ -1523,7 +1529,7 @@ def main(
         return EXIT_OK
 
     try:
-        config_path = find_config(cwd, args.config, warn)
+        config_path = find_config(config_dir, args.config, warn)
         groups = load_config(
             config_path,
             cwd,
@@ -1540,7 +1546,7 @@ def main(
     mode = "apply" if args.apply else "dry-run"
     stdout.write(f"== automover {mode} ==\n")
     stdout.write(f"Config: {config_path}\n")
-    stdout.write(f"Working directory: {cwd}\n\n")
+    stdout.write(f"Scan path: {cwd}\n\n")
 
     try:
         entries, early_skipped = collect_candidates(
