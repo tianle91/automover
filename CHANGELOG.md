@@ -11,6 +11,7 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 ### Changed
 
+- Relative `target_path` values are now resolved from the directory containing the selected config file, independently of `--scan-path`.
 - Relative `target_path` values may now resolve outside the scan path. Automover warns for these cross-directory destinations by default; use `--no-warn-external-targets` to suppress the warning.
 - Renamed `--cwd` to `--scan-path`. The config is now loaded from the command's current directory while files are scanned and moved from the scan path.
 

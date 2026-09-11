@@ -147,6 +147,7 @@ class SchemaTests(unittest.TestCase):
         photos = groups[0]
         self.assertEqual(photos.globs, ("IMG_*", "DSC*"))
         self.assertEqual(photos.types, ("image",))
+        self.assertEqual(photos.target, (example.parent / "pictures").resolve())
 
     def test_unknown_key(self):
         text = SAMPLE.replace("  keywords:", "  extra: 1\n  keywords:")
@@ -423,7 +424,8 @@ class CliTests(unittest.TestCase):
                     f"Config: {(config_dir / 'automover.yaml').resolve()}", out
                 )
                 self.assertIn(f"Scan path: {scan_path.resolve()}", out)
-                self.assertTrue((scan_path / "pictures" / "IMG_1.jpg").is_file())
+                self.assertTrue((config_dir / "pictures" / "IMG_1.jpg").is_file())
+                self.assertFalse((scan_path / "IMG_1.jpg").exists())
 
     def test_relative_config_is_resolved_from_current_directory(self):
         with write_tree({"configs/custom.yaml": SAMPLE}) as config_name:
@@ -440,7 +442,10 @@ class CliTests(unittest.TestCase):
                     f"Config: {(config_dir / 'configs/custom.yaml').resolve()}",
                     out,
                 )
-                self.assertTrue((scan_path / "pictures" / "IMG_1.jpg").is_file())
+                self.assertTrue(
+                    (config_dir / "configs" / "pictures" / "IMG_1.jpg").is_file()
+                )
+                self.assertFalse((scan_path / "IMG_1.jpg").exists())
 
     def test_external_target_warning_can_be_suppressed(self):
         text = SAMPLE.replace("target_path: pictures", "target_path: ../pictures")
