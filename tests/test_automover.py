@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -726,6 +727,73 @@ b:
             self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
             self.assertIn("destination already exists", out)
 
+    def test_conflict_overwrite_flag(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--overwrite"])
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse((cwd / "IMG_1.jpg").exists())
+            self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "new")
+            self.assertIn("overwrites existing destination", out)
+
+    def test_conflict_overwrite_folder_replaces_contents(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "report_folder/new.txt": "new",
+                "documents/report_folder/old.txt": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply", "--overwrite"])
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse((cwd / "report_folder").exists())
+            self.assertEqual((cwd / "documents/report_folder/new.txt").read_text(), "new")
+            self.assertFalse((cwd / "documents/report_folder/old.txt").exists())
+
+    def test_conflict_overwrite_dry_run(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--overwrite"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Would move:", out)
+            self.assertIn("overwrites existing destination", out)
+            self.assertEqual((cwd / "pictures/IMG_1.jpg").read_text(), "old")
+
+    def test_conflict_overwrite_restores_destination_on_move_failure(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            with patch.object(automover.shutil, "move", side_effect=OSError("move failed")):
+                code, out, err = run(cwd, ["--apply", "--overwrite"])
+            self.assertEqual(code, automover.EXIT_PARTIAL)
+            self.assertEqual((cwd / "IMG_1.jpg").read_text(), "new")
+            self.assertEqual((cwd / "pictures/IMG_1.jpg").read_text(), "old")
+            self.assertFalse(any((cwd / "pictures").glob(".automover-backup-*")))
+
+    def test_conflict_flags_are_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                automover.build_parser().parse_args(["--overwrite", "--skip-conflicts"])
+        self.assertEqual(ctx.exception.code, 2)
+
     def test_conflict_apply_without_tty_errors(self):
         with write_tree(
             {
@@ -771,6 +839,21 @@ b:
             self.assertEqual(code, 0, err + out)
             self.assertTrue((cwd / "IMG_1.jpg").is_file())
             self.assertEqual((cwd / "pictures" / "IMG_1.jpg").read_text(), "old")
+
+    def test_conflict_prompt_overwrite(self):
+        with write_tree(
+            {
+                "automover.yaml": SAMPLE,
+                "IMG_1.jpg": "new",
+                "pictures/IMG_1.jpg": "old",
+            }
+        ) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"], stdin_text="o\n", tty=True)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("[o] overwrite", err)
+            self.assertFalse((cwd / "IMG_1.jpg").exists())
+            self.assertEqual((cwd / "pictures/IMG_1.jpg").read_text(), "new")
 
     def test_missing_config(self):
         with write_tree({"file.txt": "x"}) as name:
@@ -1310,6 +1393,13 @@ class UniqueNameTests(unittest.TestCase):
             (parent / "file (1).txt").write_text("b")
             dest = automover.unique_destination(parent, "file.txt")
             self.assertEqual(dest.name, "file (2).txt")
+
+    def test_broken_symlink_is_not_available(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name)
+            (parent / "file.txt").symlink_to(parent / "missing.txt")
+            dest = automover.unique_destination(parent, "file.txt")
+            self.assertEqual(dest.name, "file (1).txt")
 
 
 if __name__ == "__main__":
