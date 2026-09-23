@@ -9,6 +9,10 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 ## [Unreleased]
 
+### Added
+
+- `--overwrite` and an interactive overwrite choice for destination conflicts. Existing destination folders are replaced in full.
+
 ### Changed
 
 - Relative `target_path` values are now resolved from the directory containing the selected config file, independently of `--scan-path`.

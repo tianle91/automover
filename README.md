@@ -64,7 +64,8 @@ Useful flags:
 | Flag | Effect | Default |
 |---|---|---|
 | `--apply` | Actually move items. | Dry-run; report without moving. |
-| `--skip-conflicts` | If the destination name already exists, skip it. **Never overwrites.** | Prompt in an interactive apply; error in a non-interactive apply. |
+| `--skip-conflicts` | If the destination name already exists, skip it. | Prompt in an interactive apply; error in a non-interactive apply. |
+| `--overwrite` | Replace an existing destination file or folder. Existing folders are replaced in full, not merged. Cannot be combined with `--skip-conflicts`. | Prompt in an interactive apply; error in a non-interactive apply. |
 | `--first-group-wins` | If an item matches multiple groups, use the first group in YAML order. | Prompt in an interactive apply; error in a non-interactive apply. |
 | `--config PATH` | Use a specific config. Absolute paths are used directly; relative paths resolve from the current directory. | Look for `automover.yaml`, then `automover.yml`, in the current directory. |
 | `--scan-path PATH` | Set the directory whose top-level entries are scanned and moved. | Current directory. |
@@ -100,11 +101,12 @@ If a config already exists, it is included so the agent can revise it. Hidden na
 
 ## Conflicts and overlaps
 
-**Destination exists** (never overwritten):
+**Destination exists:**
 
-- Interactive `--apply`: prompt to skip or rename (`file (1).txt`, …).
+- Interactive `--apply`: prompt to skip, rename (`file (1).txt`, …), or overwrite.
 - `--skip-conflicts`: skip the item.
-- Non-interactive `--apply` without that flag: error (so CI does not hang or silently skip).
+- `--overwrite`: replace the destination. For folders, this removes the old folder and its contents after the move succeeds.
+- Non-interactive `--apply` without either flag: error (so CI does not hang or silently skip).
 
 **Multiple groups match:**
 

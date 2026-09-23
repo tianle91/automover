@@ -27,6 +27,7 @@ import argparse
 import fnmatch
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
@@ -668,6 +669,7 @@ class Action:
     kind: str
     detail: str = ""
     reason: str = ""
+    overwrite: bool = False
 
     def rel(self, cwd: Path) -> str:
         try:
@@ -758,14 +760,14 @@ def matching_groups(name: str, kind: str, groups: Iterable[Group]) -> list[Match
 
 def unique_destination(parent: Path, name: str) -> Path:
     candidate = parent / name
-    if not candidate.exists():
+    if not (candidate.exists() or candidate.is_symlink()):
         return candidate
     stem = Path(name).stem
     suffix = Path(name).suffix
     n = 1
     while n <= 10_000:
         candidate = parent / f"{stem} ({n}){suffix}"
-        if not candidate.exists():
+        if not (candidate.exists() or candidate.is_symlink()):
             return candidate
         n += 1
     raise OSError(f"could not find a free name for {name!r} in {parent}")
@@ -823,10 +825,11 @@ def prompt_conflict(
     except ValueError:
         dest_rel = dest
     prompt_out.write(
-        f"\nConflict: {source_name!r} already exists at {dest_rel.as_posix()} (never overwrites)\n"
+        f"\nConflict: {source_name!r} already exists at {dest_rel.as_posix()}\n"
     )
     prompt_out.write("  [s] skip this item\n")
     prompt_out.write("  [r] rename to a unique name\n")
+    prompt_out.write("  [o] overwrite the destination\n")
     prompt_out.write("  [q] abort\n")
     while True:
         choice = _read_choice(stdin, prompt_out, "Choose resolution: ")
@@ -837,7 +840,9 @@ def prompt_conflict(
             return None
         if lowered == "r":
             return unique_destination(dest.parent, dest.name)
-        prompt_out.write(f"  invalid choice {choice!r}; enter s, r, or q\n")
+        if lowered == "o":
+            return dest
+        prompt_out.write(f"  invalid choice {choice!r}; enter s, r, o, or q\n")
 
 
 @dataclass
@@ -1159,6 +1164,7 @@ def plan_moves(
     *,
     apply: bool,
     skip_conflicts: bool,
+    overwrite: bool,
     first_group_wins: bool,
     stdin: TextIO,
     prompt_out: TextIO,
@@ -1214,7 +1220,8 @@ def plan_moves(
             continue
 
         dest = chosen.group.target / entry.name
-        if dest.exists():
+        replace = False
+        if dest.exists() or dest.is_symlink():
             if skip_conflicts:
                 plan.skipped.append(
                     Action(
@@ -1228,7 +1235,9 @@ def plan_moves(
                     )
                 )
                 continue
-            if apply and interactive:
+            if overwrite:
+                replace = True
+            elif apply and interactive:
                 renamed = prompt_conflict(entry.name, dest, cwd, stdin, prompt_out)
                 if renamed is None:
                     plan.skipped.append(
@@ -1244,15 +1253,16 @@ def plan_moves(
                     )
                     continue
                 dest = renamed
+                replace = dest == chosen.group.target / entry.name
             elif apply and not interactive:
                 try:
                     dest_rel = dest.relative_to(cwd)
                 except ValueError:
                     dest_rel = dest
                 raise ConfigError(
-                    f"destination already exists: {dest_rel.as_posix()} "
-                    "(never overwrites). Re-run with --skip-conflicts, "
-                    "or run --apply in a terminal to choose skip/rename."
+                    f"destination already exists: {dest_rel.as_posix()}. "
+                    "Re-run with --skip-conflicts or --overwrite, "
+                    "or run --apply in a terminal to choose skip/rename/overwrite."
                 )
             else:
                 plan.conflicts.append(
@@ -1268,7 +1278,7 @@ def plan_moves(
                 )
                 continue
 
-        note = ""
+        note = "overwrites existing destination" if replace else ""
         if dest.name != entry.name:
             note = "renamed because destination existed"
         plan.moves.append(
@@ -1280,6 +1290,7 @@ def plan_moves(
                 kind="move",
                 detail=note,
                 reason=chosen.reason,
+                overwrite=replace,
             )
         )
     return plan
@@ -1290,6 +1301,42 @@ def plan_moves(
 # ---------------------------------------------------------------------------
 
 
+def move_overwriting(source: Path, dest: Path) -> None:
+    """Replace an existing destination, restoring it if the new move fails."""
+    if not (dest.exists() or dest.is_symlink()):
+        shutil.move(str(source), str(dest))
+        return
+
+    backup_dir = Path(tempfile.mkdtemp(prefix=".automover-backup-", dir=dest.parent))
+    backup = backup_dir / dest.name
+    try:
+        dest.rename(backup)
+    except OSError:
+        backup_dir.rmdir()
+        raise
+    try:
+        shutil.move(str(source), str(dest))
+    except OSError as exc:
+        try:
+            if dest.is_dir() and not dest.is_symlink():
+                shutil.rmtree(dest)
+            elif dest.exists() or dest.is_symlink():
+                dest.unlink()
+            backup.rename(dest)
+            backup_dir.rmdir()
+        except OSError as restore_exc:
+            raise OSError(
+                f"move failed: {exc}; could not restore destination; "
+                f"previous destination is at {backup}: {restore_exc}"
+            ) from restore_exc
+        raise
+    if backup.is_dir() and not backup.is_symlink():
+        shutil.rmtree(backup)
+    else:
+        backup.unlink()
+    backup_dir.rmdir()
+
+
 def perform_moves(plan: Plan) -> list[Action]:
     failed: list[Action] = []
     remaining: list[Action] = []
@@ -1297,9 +1344,12 @@ def perform_moves(plan: Plan) -> list[Action]:
         assert action.dest is not None
         try:
             action.dest.parent.mkdir(parents=True, exist_ok=True)
-            if action.dest.exists():
-                raise OSError("destination appeared before the move (never overwrites)")
-            shutil.move(str(action.source), str(action.dest))
+            if action.overwrite:
+                move_overwriting(action.source, action.dest)
+            else:
+                if action.dest.exists() or action.dest.is_symlink():
+                    raise OSError("destination appeared before the move")
+                shutil.move(str(action.source), str(action.dest))
             remaining.append(action)
         except OSError as exc:
             failed.append(
@@ -1358,13 +1408,13 @@ def print_plan(
         )
 
     if plan.conflicts:
-        stdout.write("Would prompt (destination exists; never overwrites):\n")
+        stdout.write("Would prompt (destination exists):\n")
         for action in plan.conflicts:
             dest = _rel(action.dest, cwd) if action.dest is not None else "?"
             stdout.write(f"  {action.rel(cwd)} -> {dest}\n")
         stdout.write(
-            "  pass --skip-conflicts to skip these items, "
-            "or re-run with --apply in a terminal to choose skip/rename.\n\n"
+            "  pass --skip-conflicts to skip or --overwrite to replace these items, "
+            "or re-run with --apply in a terminal to choose skip/rename/overwrite.\n\n"
         )
 
     skipped_to_show = plan.skipped if verbose else [
@@ -1443,13 +1493,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not warn when a relative target_path resolves outside the scan path.",
     )
-    parser.add_argument(
+    conflict_flags = parser.add_mutually_exclusive_group()
+    conflict_flags.add_argument(
         "--skip-conflicts",
         action="store_true",
-        help=(
-            "If a destination name already exists, skip the item instead of prompting. "
-            "Never overwrites."
-        ),
+        help="If a destination name already exists, skip the item instead of prompting.",
+    )
+    conflict_flags.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing destination files or folders instead of prompting.",
     )
     parser.add_argument(
         "--first-group-wins",
@@ -1568,6 +1621,7 @@ def main(
             groups,
             apply=args.apply,
             skip_conflicts=args.skip_conflicts,
+            overwrite=args.overwrite,
             first_group_wins=args.first_group_wins,
             stdin=stdin,
             prompt_out=stderr,
