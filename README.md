@@ -27,7 +27,7 @@ some_example_group:
     - "report-????.*"
 ```
 
-Each top-level key is a group. Groups are tried in file order.
+Each top-level key is a group, except the optional `move_target_templates` section. Groups are tried in file order.
 
 | Field | Meaning |
 |---|---|
@@ -47,6 +47,47 @@ A file matches when:
 3. if `types` and/or `extensions` are set, the last suffix is in that allow-list
 
 See `examples/automover.yaml` for a fuller sample.
+
+### Reusing move targets
+
+Define named `move_target_templates` at the top level, then use a template name
+instead of an inline `move_targets` block:
+
+```yaml
+move_target_templates:
+  documents:
+    files: true
+    folders: false
+    types:
+      - documents
+    extensions:
+      - eml
+
+invoices:
+  target_path: invoices
+  move_targets: documents
+  keywords:
+    - invoice
+    - receipt
+
+reports:
+  target_path: reports
+  move_targets: documents
+  keywords:
+    - report
+```
+
+Templates contain exactly the same fields as an inline `move_targets` block:
+required `files` and `folders` booleans, plus optional `types` and `extensions`.
+Groups still define their own `target_path`, `keywords`, and `globs`. Inline
+blocks and template references can be mixed in one config. Templates may appear
+before or after groups; they do not affect group order.
+
+Unknown names and invalid templates (including unused ones) fail validation.
+There is no inheritance, per-group template override, or variable substitution.
+The YAML subset still requires block lists, rather than `[a, b]` syntax.
+Existing configs remain valid, including a legacy group named
+`move_target_templates` when it has `target_path` and `move_targets` fields.
 
 ## Usage
 

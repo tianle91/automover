@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
 
-_FALLBACK_VERSION = "0.3.0"
+_FALLBACK_VERSION = "0.4.0"
 
 
 def _load_version() -> str:
@@ -468,6 +468,44 @@ def _parse_extensions(value: Any, *, group_name: str) -> list[str]:
     return parsed
 
 
+def _validate_move_targets(
+    move_targets: Any, name: str
+) -> tuple[bool, bool, list[str], list[str]]:
+    if not isinstance(move_targets, dict):
+        raise ConfigError(f"group {name!r}: move_targets must be a mapping")
+    extra_mt = set(move_targets) - MOVE_TARGET_KEYS
+    if extra_mt:
+        raise ConfigError(
+            f"group {name!r}: unknown move_targets keys: {', '.join(sorted(extra_mt))}"
+        )
+    missing_mt = REQUIRED_MOVE_TARGET_KEYS - set(move_targets)
+    if missing_mt:
+        raise ConfigError(
+            f"group {name!r}: missing move_targets keys: {', '.join(sorted(missing_mt))}"
+        )
+    move_files = move_targets["files"]
+    move_folders = move_targets["folders"]
+    if not isinstance(move_files, bool) or not isinstance(move_folders, bool):
+        raise ConfigError(
+            f"group {name!r}: move_targets.files and folders must be booleans"
+        )
+    if not move_files and not move_folders:
+        raise ConfigError(
+            f"group {name!r}: move_targets.files and folders cannot both be false"
+        )
+
+    parsed_types = _parse_types(move_targets.get("types"), group_name=name)
+    parsed_extensions = _parse_extensions(
+        move_targets.get("extensions"), group_name=name
+    )
+    if (parsed_types or parsed_extensions) and not move_files:
+        raise ConfigError(
+            f"group {name!r}: move_targets.types/extensions require files: true"
+        )
+
+    return move_files, move_folders, parsed_types, parsed_extensions
+
+
 def validate_groups(
     data: Any,
     scan_path: Path,
@@ -477,8 +515,29 @@ def validate_groups(
     if not isinstance(data, dict) or not data:
         raise ConfigError("config root must be a non-empty mapping of group names")
 
+    # Preserve legacy configs with a group named move_target_templates.
+    template_section = data.get("move_target_templates")
+    is_legacy_group = (
+        isinstance(template_section, dict)
+        and REQUIRED_GROUP_KEYS <= set(template_section)
+        and isinstance(template_section["target_path"], str)
+    )
+    has_templates = "move_target_templates" in data and not is_legacy_group
+    templates: dict[str, Any] = {}
+    if has_templates:
+        if not isinstance(template_section, dict) or not template_section:
+            raise ConfigError("move_target_templates must be a non-empty mapping")
+        for template_name, template_body in template_section.items():
+            if not isinstance(template_name, str) or not template_name.strip():
+                raise ConfigError("move_target_templates names must be non-empty strings")
+            # Validate unused templates too; template references cannot be chained.
+            _validate_move_targets(template_body, f"template {template_name}")
+            templates[template_name] = template_body
+
     groups: list[Group] = []
     for name, body in data.items():
+        if has_templates and name == "move_target_templates":
+            continue
         if not isinstance(name, str) or not name.strip():
             raise ConfigError("group names must be non-empty strings")
         if not isinstance(body, dict):
@@ -521,37 +580,15 @@ def validate_groups(
             )
 
         move_targets = body["move_targets"]
-        if not isinstance(move_targets, dict):
-            raise ConfigError(f"group {name!r}: move_targets must be a mapping")
-        extra_mt = set(move_targets) - MOVE_TARGET_KEYS
-        if extra_mt:
-            raise ConfigError(
-                f"group {name!r}: unknown move_targets keys: {', '.join(sorted(extra_mt))}"
-            )
-        missing_mt = REQUIRED_MOVE_TARGET_KEYS - set(move_targets)
-        if missing_mt:
-            raise ConfigError(
-                f"group {name!r}: missing move_targets keys: {', '.join(sorted(missing_mt))}"
-            )
-        move_files = move_targets["files"]
-        move_folders = move_targets["folders"]
-        if not isinstance(move_files, bool) or not isinstance(move_folders, bool):
-            raise ConfigError(
-                f"group {name!r}: move_targets.files and folders must be booleans"
-            )
-        if not move_files and not move_folders:
-            raise ConfigError(
-                f"group {name!r}: move_targets.files and folders cannot both be false"
-            )
-
-        parsed_types = _parse_types(move_targets.get("types"), group_name=name)
-        parsed_extensions = _parse_extensions(
-            move_targets.get("extensions"), group_name=name
+        if isinstance(move_targets, str):
+            if move_targets not in templates:
+                raise ConfigError(
+                    f"group {name!r}: unknown move_targets template {move_targets!r}"
+                )
+            move_targets = templates[move_targets]
+        move_files, move_folders, parsed_types, parsed_extensions = (
+            _validate_move_targets(move_targets, name)
         )
-        if (parsed_types or parsed_extensions) and not move_files:
-            raise ConfigError(
-                f"group {name!r}: move_targets.types/extensions require files: true"
-            )
 
         parsed_keywords = _parse_keywords(body.get("keywords"), group_name=name)
         parsed_globs = _parse_globs(body.get("globs"), group_name=name)
@@ -584,6 +621,8 @@ def validate_groups(
                 extensions=tuple(parsed_extensions),
             )
         )
+    if not groups:
+        raise ConfigError("config must contain at least one group")
     return groups
 
 
@@ -1058,7 +1097,7 @@ Do not move, copy, or delete files. Do not run automover. Output only the YAML f
 It scans only the top level of the scan path (no recursion) and moves matching files/folders into per-group target directories. Dry-run is the default; the user will run --apply later.
 
 ## Schema
-Each top-level key is a group. Groups are tried in file order. First match can overlap; avoid overlap when you can.
+Each top-level key is a group, except the optional move_target_templates section. Groups are tried in file order. First match can overlap; avoid overlap when you can.
 
 ```yaml
 group_name:
@@ -1079,6 +1118,7 @@ group_name:
 
 Rules:
 - target_path is resolved from the directory containing the config file. It must be relative and cannot be `.` or an absolute path. It may use `..` to target a directory outside the scan path; automover warns about that by default.
+- move_targets can be an inline mapping or a string naming a template in the top-level move_target_templates mapping. Each template contains only files, folders, and optional types/extensions, exactly like an inline move_targets block. No inheritance, overrides, or variables. Do not emit unused templates.
 - move_targets.files and folders are required booleans; at least one must be true.
 - types is optional. Supported values only:
 {format_type_catalog()}
