@@ -128,6 +128,139 @@ group:
             automover.load_simple_yaml("\n# only comments\n")
 
 
+class MoveTargetTemplateTests(unittest.TestCase):
+    CONFIG = """\
+move_target_templates:
+  documents:
+    files: true
+    folders: false
+    types:
+      - documents
+    extensions:
+      - eml
+invoices:
+  target_path: invoices
+  move_targets: documents
+  keywords:
+    - invoice
+reports:
+  target_path: reports
+  move_targets: documents
+  keywords:
+    - report
+"""
+
+    def test_matches_inline_groups_and_preserves_order(self):
+        inline = self.CONFIG.split("invoices:", 1)[1]
+        inline = "invoices:" + inline
+        inline = inline.replace(
+            "  move_targets: documents",
+            "  move_targets:\n    files: true\n    folders: false\n"
+            "    types:\n      - documents\n    extensions:\n      - eml",
+        )
+        with tempfile.TemporaryDirectory() as name:
+            cwd = Path(name)
+            expected = automover.validate_groups(automover.load_simple_yaml(inline), cwd)
+            actual = automover.validate_groups(automover.load_simple_yaml(self.CONFIG), cwd)
+            self.assertEqual(actual, expected)
+            # Definitions can follow their users without affecting group order.
+            section, groups = self.CONFIG.split("invoices:", 1)
+            reordered = "invoices:" + groups + section
+            self.assertEqual(
+                automover.validate_groups(automover.load_simple_yaml(reordered), cwd),
+                expected,
+            )
+
+    def test_validate_dry_run_and_apply(self):
+        with write_tree({
+            "automover.yaml": self.CONFIG,
+            "invoice.pdf": "invoice",
+            "report.eml": "report",
+            "invoice.jpg": "unmatched",
+            "invoice_folder": None,
+        }) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--validate"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("(2 group(s))", out)
+            code, out, err = run(cwd, [])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "invoice.pdf").exists())
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "invoices/invoice.pdf").is_file())
+            self.assertTrue((cwd / "reports/report.eml").is_file())
+            self.assertTrue((cwd / "invoice.jpg").is_file())
+            self.assertTrue((cwd / "invoice_folder").is_dir())
+
+    def test_rejects_unknown_template(self):
+        text = self.CONFIG.replace("move_targets: documents", "move_targets: missing")
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaisesRegex(automover.ConfigError, "unknown move_targets template 'missing'"):
+                automover.validate_groups(automover.load_simple_yaml(text), Path(name))
+
+    def test_rejects_invalid_templates_even_when_unused(self):
+        invalid = [
+            "move_target_templates: nope\n",
+            "move_target_templates:\n",
+            "move_target_templates:\n  unused: other\n",
+            "move_target_templates:\n  unused:\n    files: true\n",
+            "move_target_templates:\n  unused:\n    files: true\n    folders: false\n    typo: true\n",
+            "move_target_templates:\n  unused:\n    files: false\n    folders: false\n",
+            "move_target_templates:\n  unused:\n    files: false\n    folders: true\n    types:\n      - image\n",
+            "move_target_templates:\n  unused:\n    files: true\n    folders: false\n    types:\n      - unknown\n",
+        ]
+        for section in invalid:
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as name:
+                with self.assertRaises(automover.ConfigError):
+                    automover.validate_groups(automover.load_simple_yaml(section + SAMPLE), Path(name))
+
+    def test_templates_alone_are_not_a_valid_config(self):
+        section = self.CONFIG.split("invoices:", 1)[0]
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaisesRegex(automover.ConfigError, "at least one group"):
+                automover.validate_groups(automover.load_simple_yaml(section), Path(name))
+
+    def test_folder_template_still_requires_group_name_matchers(self):
+        text = """\
+move_target_templates:
+  folders:
+    files: false
+    folders: true
+albums:
+  target_path: albums
+  move_targets: folders
+"""
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaisesRegex(automover.ConfigError, "requires keywords or globs"):
+                automover.validate_groups(automover.load_simple_yaml(text), Path(name))
+
+    def test_template_names_can_match_group_fields(self):
+        text = """\
+move_target_templates:
+  target_path:
+    files: true
+    folders: false
+  move_targets:
+    files: true
+    folders: false
+photos:
+  target_path: pictures
+  move_targets: target_path
+  keywords:
+    - photo
+"""
+        with tempfile.TemporaryDirectory() as name:
+            groups = automover.validate_groups(automover.load_simple_yaml(text), Path(name))
+            self.assertEqual([g.name for g in groups], ["photos"])
+
+    def test_legacy_group_named_move_target_templates(self):
+        text = SAMPLE.replace("photos:", "move_target_templates:")
+        with tempfile.TemporaryDirectory() as name:
+            groups = automover.validate_groups(automover.load_simple_yaml(text), Path(name))
+            self.assertEqual([g.name for g in groups], ["move_target_templates", "docs"])
+
+
 class SchemaTests(unittest.TestCase):
     def test_validate_ok(self):
         with write_tree({"automover.yaml": SAMPLE}) as name:

@@ -9,7 +9,11 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-24
+
 ### Added
+
+- Named `move_target_templates` for reusing `files`, `folders`, `types`, and `extensions` via `move_targets: template_name`. Inline blocks remain supported.
 
 - `--overwrite` and an interactive overwrite choice for destination conflicts. Existing destination folders are replaced in full.
 
