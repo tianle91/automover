@@ -9,6 +9,14 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 ## [Unreleased]
 
+### Changed
+
+- Keywords now match case-sensitive whole words or phrases. Spaces, punctuation, and underscores separate words, so `ive` no longer matches `live`. Use globs such as `*ive*` for substring matching or `IMG_*` for prefixes.
+
+### Fixed
+
+- Canonically equivalent NFC/NFD basenames and keywords/globs now match using Unicode NFC normalization. Original filenames, paths, and rule text are preserved for moves and reporting, and matching remains case-sensitive.
+
 ## [0.4.0] - 2026-10-24
 
 ### Added

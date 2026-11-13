@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
@@ -753,11 +755,17 @@ def name_match_reason(name: str, group: Group) -> Optional[str]:
     """
     if not group.keywords and not group.globs:
         return ""
+    normalized_name = unicodedata.normalize("NFC", name)
     for keyword in group.keywords:
-        if keyword in name:
+        normalized_keyword = unicodedata.normalize("NFC", keyword)
+        # Unicode letters/digits bound words; underscores separate filename words.
+        if re.search(
+            r"(?<![^\W_])" + re.escape(normalized_keyword) + r"(?![^\W_])",
+            normalized_name,
+        ):
             return f"keyword: {keyword}"
     for pattern in group.globs:
-        if fnmatch.fnmatchcase(name, pattern):
+        if fnmatch.fnmatchcase(normalized_name, unicodedata.normalize("NFC", pattern)):
             return f"glob: {pattern}"
     return None
 
@@ -1110,7 +1118,7 @@ group_name:
     extensions:
       - eml
   keywords:
-    - IMG_
+    - IMG
   globs:
     - "DSC*"
     - "vacation-????.*"
@@ -1124,8 +1132,9 @@ Rules:
 {format_type_catalog()}
 - extensions is optional (jpg or .jpg). Unioned with types. Match the last suffix (Path.suffix), not the stem. Compound suffixes like tar.gz match the trailing name.
 - types/extensions apply to files only. folders: true requires keywords or globs.
-- keywords are case-sensitive substrings of the full basename (including extension).
+- keywords are case-sensitive whole words or phrases in the full basename (including extension). Adjacent Unicode letters/digits prevent a match; spaces, punctuation, and underscores separate words. For example, ive matches ive_live.webm but not live.webm. Use globs such as *ive* for substring matching.
 - globs are case-sensitive fnmatch patterns against the full basename (so IMG_* and *.jpg both work). Do not glob the stem; use extensions for suffix-only filters.
+- Basenames and keywords/globs are normalized to Unicode NFC for matching, so canonically equivalent NFC/NFD text matches. Original filenames, paths, and rule text are preserved for filesystem operations and reporting. Matching remains case-sensitive.
 - A group needs at least one of: keywords, globs, types, extensions. Name matchers (keywords/globs) are OR; the type/extension filter is AND with the name matchers.
 - Do not invent types. Use extensions for suffixes that are not in the lists above. video does not include .ts (TypeScript collision).
 - documents includes office files plus .txt/.md/.csv and similar text notes, not HTML.
@@ -1506,7 +1515,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="automover",
         description=(
             "Move top-level files and folders using automover.yaml. "
-            "Match on case-sensitive keyword substrings, globs, and/or file types. "
+            "Match on case-sensitive whole keywords, globs, and/or file types. "
             "Default mode is dry-run. "
             "Use --prompt (or: prompt) to print an AI prompt for generating the YAML; "
             "automover does not call a model."

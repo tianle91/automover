@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import unittest
+import unicodedata
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -29,7 +31,7 @@ photos:
     files: true
     folders: false
   keywords:
-    - IMG_
+    - IMG
     - photo
 docs:
   target_path: documents
@@ -502,12 +504,82 @@ class FindConfigTests(unittest.TestCase):
 
 
 class MatchTests(unittest.TestCase):
-    def test_substring_case_sensitive(self):
+    def test_canonical_unicode_keyword_and_glob_matching(self):
+        group = automover.validate_groups({
+            "example": {
+                "target_path": "sorted",
+                "move_targets": {"files": True, "folders": True},
+                "keywords": ["placeholder"],
+            },
+        }, ROOT)[0]
+        for term in ("café", "이주은"):
+            for name_form in ("NFC", "NFD"):
+                name = unicodedata.normalize(name_form, term + ".txt")
+                for rule_form in ("NFC", "NFD"):
+                    for matcher in ("keywords", "globs"):
+                        rule = unicodedata.normalize(rule_form, term)
+                        rules = {"keywords": (), "globs": ()}
+                        reason_kind = "keyword"
+                        if matcher == "globs":
+                            rule += "*.txt"
+                            reason_kind = "glob"
+                        rules[matcher] = (rule,)
+                        configured = replace(group, **rules)
+                        with self.subTest(
+                            term=term, name_form=name_form,
+                            rule_form=rule_form, matcher=matcher,
+                        ):
+                            self.assertEqual(
+                                automover.name_match_reason(name, configured),
+                                f"{reason_kind}: {rule}",
+                            )
+                            for unrelated in (
+                                "unrelated.txt", "CAFÉ.txt", "ｃａｆé.txt",
+                            ):
+                                self.assertIsNone(
+                                    automover.name_match_reason(unrelated, configured)
+                                )
+
+    def test_keyword_word_boundaries(self):
+        cases = {
+            "ive": {
+                "ive": True,
+                "ive.webm": True,
+                "#ive-live.webm": True,
+                "concert_ive_live.webm": True,
+                "live ive.webm": True,
+                "live.webm": False,
+                "lively.webm": False,
+                "ive2.webm": False,
+                "2ive.webm": False,
+                "IVE.webm": False,
+                "éive.webm": False,
+                "ive한.webm": False,
+                "e\u0301ive.webm": False,
+            },
+            "李珠珢": {"#李珠珢.webm": True, "李珠珢舞.webm": False},
+            "Lee Ju Eun": {
+                "[Lee Ju Eun]_dance.webm": True,
+                "Lee Ju Eunice.webm": False,
+            },
+            "A+B": {"[A+B].webm": True, "AAAB.webm": False},
+        }
+        for keyword, filenames in cases.items():
+            config = SAMPLE.replace("    - IMG\n    - photo", f"    - {keyword}")
+            with write_tree({"automover.yaml": config}) as directory:
+                root = Path(directory)
+                groups = automover.load_config(root / "automover.yaml", root)
+            for filename, expected in filenames.items():
+                with self.subTest(keyword=keyword, filename=filename):
+                    hits = automover.matching_groups(filename, "file", groups)
+                    self.assertEqual(bool(hits), expected)
+
+    def test_whole_word_case_sensitive(self):
         with write_tree({"automover.yaml": SAMPLE}) as name:
             groups = automover.load_config(Path(name) / "automover.yaml", Path(name))
         hits = automover.matching_groups("IMG_1234.jpg", "file", groups)
         self.assertEqual([h.group.name for h in hits], ["photos"])
-        self.assertEqual(hits[0].keyword, "IMG_")
+        self.assertEqual(hits[0].keyword, "IMG")
 
         self.assertEqual(automover.matching_groups("img_1234.jpg", "file", groups), [])
 
@@ -1047,13 +1119,55 @@ b:
             self.assertFalse((cwd / "pictures" / "IMG_link.jpg").exists())
             self.assertIn("symlinks are not moved", out)
 
-    def test_substring_in_middle(self):
+    def test_word_between_underscores(self):
         with write_tree(
             {"automover.yaml": SAMPLE, "vacation_photo_1.png": "x"}
         ) as name:
             cwd = Path(name)
             run(cwd, ["--apply"])
             self.assertTrue((cwd / "pictures" / "vacation_photo_1.png").is_file())
+
+    def test_apply_moves_only_whole_keyword_files_and_folders(self):
+        config = SAMPLE.replace("    - invoice\n    - report", "    - ive")
+        with write_tree({
+            "automover.yaml": config,
+            "ive_live.webm": "video",
+            "live.webm": "other video",
+            "#ive/clip.webm": "clip",
+            "live/clip.webm": "other clip",
+        }) as directory:
+            cwd = Path(directory)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "documents/ive_live.webm").is_file())
+            self.assertTrue((cwd / "documents/#ive/clip.webm").is_file())
+            self.assertTrue((cwd / "live.webm").is_file())
+            self.assertTrue((cwd / "live/clip.webm").is_file())
+
+    def test_unicode_matching_preserves_original_filename_and_rule_in_report(self):
+        for matcher, rule in (("keywords", "café"), ("globs", "café*.txt")):
+            config = f"""\
+example:
+  target_path: sorted
+  move_targets:
+    files: true
+    folders: false
+  {matcher}:
+    - {rule}
+"""
+            filename = "cafe\u0301.txt"
+            with self.subTest(matcher=matcher):
+                with write_tree({"automover.yaml": config, filename: "contents"}) as directory:
+                    cwd = Path(directory)
+                    original_name = next(p.name for p in cwd.iterdir() if p.suffix == ".txt")
+                    code, out, err = run(cwd, ["--apply", "--verbose"])
+                    self.assertEqual(code, 0, err)
+                    moved = list((cwd / "sorted").iterdir())
+                    self.assertEqual([p.name for p in moved], [original_name])
+                    self.assertEqual(moved[0].read_text(encoding="utf-8"), "contents")
+                    self.assertFalse((cwd / original_name).exists())
+                    self.assertIn(original_name, out)
+                    self.assertIn(rule, out)
 
     def test_nested_target_path_created(self):
         text = """\
@@ -1063,7 +1177,7 @@ g:
     files: true
     folders: false
   keywords:
-    - IMG_
+    - IMG
 """
         with write_tree({"automover.yaml": text, "IMG_2.jpg": "x"}) as name:
             cwd = Path(name)
