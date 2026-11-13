@@ -4,7 +4,8 @@
 #   python3 automover.py           # dry-run
 #   python3 automover.py --apply   # move
 #
-# Matching is a case-sensitive substring or glob of each top-level basename.
+# Keywords match case-sensitive whole words/phrases in each top-level basename.
+# Spaces, punctuation, and underscores separate words. Globs match patterns.
 # types/extensions are optional file filters (union of last suffixes).
 
 photos:

@@ -29,7 +29,7 @@ photos:
     files: true
     folders: false
   keywords:
-    - IMG_
+    - IMG
     - photo
 docs:
   target_path: documents
@@ -502,12 +502,45 @@ class FindConfigTests(unittest.TestCase):
 
 
 class MatchTests(unittest.TestCase):
-    def test_substring_case_sensitive(self):
+    def test_keyword_word_boundaries(self):
+        cases = {
+            "ive": {
+                "ive": True,
+                "ive.webm": True,
+                "#ive-live.webm": True,
+                "concert_ive_live.webm": True,
+                "live ive.webm": True,
+                "live.webm": False,
+                "lively.webm": False,
+                "ive2.webm": False,
+                "2ive.webm": False,
+                "IVE.webm": False,
+                "éive.webm": False,
+                "ive한.webm": False,
+            },
+            "李珠珢": {"#李珠珢.webm": True, "李珠珢舞.webm": False},
+            "Lee Ju Eun": {
+                "[Lee Ju Eun]_dance.webm": True,
+                "Lee Ju Eunice.webm": False,
+            },
+            "A+B": {"[A+B].webm": True, "AAAB.webm": False},
+        }
+        for keyword, filenames in cases.items():
+            config = SAMPLE.replace("    - IMG\n    - photo", f"    - {keyword}")
+            with write_tree({"automover.yaml": config}) as directory:
+                root = Path(directory)
+                groups = automover.load_config(root / "automover.yaml", root)
+            for filename, expected in filenames.items():
+                with self.subTest(keyword=keyword, filename=filename):
+                    hits = automover.matching_groups(filename, "file", groups)
+                    self.assertEqual(bool(hits), expected)
+
+    def test_whole_word_case_sensitive(self):
         with write_tree({"automover.yaml": SAMPLE}) as name:
             groups = automover.load_config(Path(name) / "automover.yaml", Path(name))
         hits = automover.matching_groups("IMG_1234.jpg", "file", groups)
         self.assertEqual([h.group.name for h in hits], ["photos"])
-        self.assertEqual(hits[0].keyword, "IMG_")
+        self.assertEqual(hits[0].keyword, "IMG")
 
         self.assertEqual(automover.matching_groups("img_1234.jpg", "file", groups), [])
 
@@ -1047,13 +1080,30 @@ b:
             self.assertFalse((cwd / "pictures" / "IMG_link.jpg").exists())
             self.assertIn("symlinks are not moved", out)
 
-    def test_substring_in_middle(self):
+    def test_word_between_underscores(self):
         with write_tree(
             {"automover.yaml": SAMPLE, "vacation_photo_1.png": "x"}
         ) as name:
             cwd = Path(name)
             run(cwd, ["--apply"])
             self.assertTrue((cwd / "pictures" / "vacation_photo_1.png").is_file())
+
+    def test_apply_moves_only_whole_keyword_files_and_folders(self):
+        config = SAMPLE.replace("    - invoice\n    - report", "    - ive")
+        with write_tree({
+            "automover.yaml": config,
+            "ive_live.webm": "video",
+            "live.webm": "other video",
+            "#ive/clip.webm": "clip",
+            "live/clip.webm": "other clip",
+        }) as directory:
+            cwd = Path(directory)
+            code, out, err = run(cwd, ["--apply"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue((cwd / "documents/ive_live.webm").is_file())
+            self.assertTrue((cwd / "documents/#ive/clip.webm").is_file())
+            self.assertTrue((cwd / "live.webm").is_file())
+            self.assertTrue((cwd / "live/clip.webm").is_file())
 
     def test_nested_target_path_created(self):
         text = """\
@@ -1063,7 +1113,7 @@ g:
     files: true
     folders: false
   keywords:
-    - IMG_
+    - IMG
 """
         with write_tree({"automover.yaml": text, "IMG_2.jpg": "x"}) as name:
             cwd = Path(name)

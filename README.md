@@ -20,7 +20,7 @@ some_example_group:
     extensions:     # optional extra suffixes (unioned with types)
       - eml
   keywords:
-    # case sensitive substrings of the basename; optional if types/extensions/globs are set
+    # case-sensitive whole words/phrases; optional if types/extensions/globs are set
     - first_keyword
   globs:
     - "IMG_*"
@@ -35,7 +35,7 @@ Each top-level key is a group, except the optional `move_target_templates` secti
 | `move_targets.files` / `folders` | Whether this group considers files, folders, or both. At least one must be true. |
 | `move_targets.types` | Optional file-type categories. Supported: `image`, `audio`, `video`, `documents`. `video` does not include `.ts` (TypeScript). `documents` includes office files and also `.txt` / `.md` / `.csv`, not HTML. |
 | `move_targets.extensions` | Optional suffix list (`jpg` or `.jpg`). Unioned with `types`. Matches the last suffix (`Path.suffix`), not the stem. Compound values like `tar.gz` match the trailing name. |
-| `keywords` | Case-sensitive **substrings** of the full basename. |
+| `keywords` | Case-sensitive **whole words or phrases** in the full basename. Adjacent Unicode letters/digits prevent a match. Spaces, punctuation, and underscores separate words. |
 | `globs` | Case-sensitive `fnmatch` patterns against the full basename (`IMG_*`, `*.jpg`). Keywords and globs are OR. |
 
 Type filters apply to **files only**. Folders still match on keywords or globs.
@@ -134,7 +134,8 @@ If a config already exists, it is included so the agent can revise it. Hidden na
 ## Matching rules (v1)
 
 - Scans **only the top level** of the scan path (no recursion).
-- Keyword match is a case-sensitive substring of the **basename**. Glob match is case-sensitive `fnmatch` on the same basename (not the stem), so `IMG_*` and `*.jpg` both work.
+- Keywords match case-sensitive whole words or phrases in the **basename**, including the extension. `ive` matches `ive_live.webm`, `#ive.webm`, and `ive.webm`, but not `live.webm` or `ive2.webm`. Unicode letters and digits count as word characters; spaces, punctuation, and underscores are separators. For substring matching, use a glob such as `*ive*`. For prefixes such as `IMG_`, use `IMG_*` in `globs`.
+- Glob match is case-sensitive `fnmatch` on the same basename (not the stem), so `IMG_*` and `*.jpg` both work.
 - Multiple keywords/globs in one group are OR. `types` and `extensions` together are OR (union). Name matchers **and** the type filter are AND.
 - Extensions use the last suffix (`Path.suffix`), not the stem. `Photo.JPG` is an image. `tar.gz` is matched as a trailing compound suffix.
 - Hidden names (starting with `.`), the config file, each target directory inside the scan path, and symlinks are skipped. Targets are resolved relative to the config file's directory; targets outside the scan path are supported and emit a warning unless `--no-warn-external-targets` is used.

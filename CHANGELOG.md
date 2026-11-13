@@ -9,6 +9,10 @@ The current version is the single line in [`VERSION`](VERSION). `python3 automov
 
 ## [Unreleased]
 
+### Changed
+
+- Keywords now match case-sensitive whole words or phrases. Spaces, punctuation, and underscores separate words, so `ive` no longer matches `live`. Use globs such as `*ive*` for substring matching or `IMG_*` for prefixes.
+
 ## [0.4.0] - 2026-10-24
 
 ### Added
