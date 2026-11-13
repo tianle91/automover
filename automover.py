@@ -29,6 +29,7 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
@@ -754,12 +755,17 @@ def name_match_reason(name: str, group: Group) -> Optional[str]:
     """
     if not group.keywords and not group.globs:
         return ""
+    normalized_name = unicodedata.normalize("NFC", name)
     for keyword in group.keywords:
+        normalized_keyword = unicodedata.normalize("NFC", keyword)
         # Unicode letters/digits bound words; underscores separate filename words.
-        if re.search(r"(?<![^\W_])" + re.escape(keyword) + r"(?![^\W_])", name):
+        if re.search(
+            r"(?<![^\W_])" + re.escape(normalized_keyword) + r"(?![^\W_])",
+            normalized_name,
+        ):
             return f"keyword: {keyword}"
     for pattern in group.globs:
-        if fnmatch.fnmatchcase(name, pattern):
+        if fnmatch.fnmatchcase(normalized_name, unicodedata.normalize("NFC", pattern)):
             return f"glob: {pattern}"
     return None
 
@@ -1128,6 +1134,7 @@ Rules:
 - types/extensions apply to files only. folders: true requires keywords or globs.
 - keywords are case-sensitive whole words or phrases in the full basename (including extension). Adjacent Unicode letters/digits prevent a match; spaces, punctuation, and underscores separate words. For example, ive matches ive_live.webm but not live.webm. Use globs such as *ive* for substring matching.
 - globs are case-sensitive fnmatch patterns against the full basename (so IMG_* and *.jpg both work). Do not glob the stem; use extensions for suffix-only filters.
+- Basenames and keywords/globs are normalized to Unicode NFC for matching, so canonically equivalent NFC/NFD text matches. Original filenames, paths, and rule text are preserved for filesystem operations and reporting. Matching remains case-sensitive.
 - A group needs at least one of: keywords, globs, types, extensions. Name matchers (keywords/globs) are OR; the type/extension filter is AND with the name matchers.
 - Do not invent types. Use extensions for suffixes that are not in the lists above. video does not include .ts (TypeScript collision).
 - documents includes office files plus .txt/.md/.csv and similar text notes, not HTML.

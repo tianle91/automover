@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import unittest
+import unicodedata
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -502,6 +504,42 @@ class FindConfigTests(unittest.TestCase):
 
 
 class MatchTests(unittest.TestCase):
+    def test_canonical_unicode_keyword_and_glob_matching(self):
+        group = automover.validate_groups({
+            "example": {
+                "target_path": "sorted",
+                "move_targets": {"files": True, "folders": True},
+                "keywords": ["placeholder"],
+            },
+        }, ROOT)[0]
+        for term in ("café", "이주은"):
+            for name_form in ("NFC", "NFD"):
+                name = unicodedata.normalize(name_form, term + ".txt")
+                for rule_form in ("NFC", "NFD"):
+                    for matcher in ("keywords", "globs"):
+                        rule = unicodedata.normalize(rule_form, term)
+                        rules = {"keywords": (), "globs": ()}
+                        reason_kind = "keyword"
+                        if matcher == "globs":
+                            rule += "*.txt"
+                            reason_kind = "glob"
+                        rules[matcher] = (rule,)
+                        configured = replace(group, **rules)
+                        with self.subTest(
+                            term=term, name_form=name_form,
+                            rule_form=rule_form, matcher=matcher,
+                        ):
+                            self.assertEqual(
+                                automover.name_match_reason(name, configured),
+                                f"{reason_kind}: {rule}",
+                            )
+                            for unrelated in (
+                                "unrelated.txt", "CAFÉ.txt", "ｃａｆé.txt",
+                            ):
+                                self.assertIsNone(
+                                    automover.name_match_reason(unrelated, configured)
+                                )
+
     def test_keyword_word_boundaries(self):
         cases = {
             "ive": {
@@ -517,6 +555,7 @@ class MatchTests(unittest.TestCase):
                 "IVE.webm": False,
                 "éive.webm": False,
                 "ive한.webm": False,
+                "e\u0301ive.webm": False,
             },
             "李珠珢": {"#李珠珢.webm": True, "李珠珢舞.webm": False},
             "Lee Ju Eun": {
@@ -1104,6 +1143,31 @@ b:
             self.assertTrue((cwd / "documents/#ive/clip.webm").is_file())
             self.assertTrue((cwd / "live.webm").is_file())
             self.assertTrue((cwd / "live/clip.webm").is_file())
+
+    def test_unicode_matching_preserves_original_filename_and_rule_in_report(self):
+        for matcher, rule in (("keywords", "café"), ("globs", "café*.txt")):
+            config = f"""\
+example:
+  target_path: sorted
+  move_targets:
+    files: true
+    folders: false
+  {matcher}:
+    - {rule}
+"""
+            filename = "cafe\u0301.txt"
+            with self.subTest(matcher=matcher):
+                with write_tree({"automover.yaml": config, filename: "contents"}) as directory:
+                    cwd = Path(directory)
+                    original_name = next(p.name for p in cwd.iterdir() if p.suffix == ".txt")
+                    code, out, err = run(cwd, ["--apply", "--verbose"])
+                    self.assertEqual(code, 0, err)
+                    moved = list((cwd / "sorted").iterdir())
+                    self.assertEqual([p.name for p in moved], [original_name])
+                    self.assertEqual(moved[0].read_text(encoding="utf-8"), "contents")
+                    self.assertFalse((cwd / original_name).exists())
+                    self.assertIn(original_name, out)
+                    self.assertIn(rule, out)
 
     def test_nested_target_path_created(self):
         text = """\

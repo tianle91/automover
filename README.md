@@ -136,6 +136,7 @@ If a config already exists, it is included so the agent can revise it. Hidden na
 - Scans **only the top level** of the scan path (no recursion).
 - Keywords match case-sensitive whole words or phrases in the **basename**, including the extension. `ive` matches `ive_live.webm`, `#ive.webm`, and `ive.webm`, but not `live.webm` or `ive2.webm`. Unicode letters and digits count as word characters; spaces, punctuation, and underscores are separators. For substring matching, use a glob such as `*ive*`. For prefixes such as `IMG_`, use `IMG_*` in `globs`.
 - Glob match is case-sensitive `fnmatch` on the same basename (not the stem), so `IMG_*` and `*.jpg` both work.
+- Basenames and keywords/globs are normalized to Unicode NFC for comparison, so canonically equivalent NFC/NFD spellings match (for example, composed and decomposed `café`). Original filenames, paths, and rule text are preserved for moves and reporting. Matching stays case-sensitive and uses canonical normalization only.
 - Multiple keywords/globs in one group are OR. `types` and `extensions` together are OR (union). Name matchers **and** the type filter are AND.
 - Extensions use the last suffix (`Path.suffix`), not the stem. `Photo.JPG` is an image. `tar.gz` is matched as a trailing compound suffix.
 - Hidden names (starting with `.`), the config file, each target directory inside the scan path, and symlinks are skipped. Targets are resolved relative to the config file's directory; targets outside the scan path are supported and emit a warning unless `--no-warn-external-targets` is used.
