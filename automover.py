@@ -27,10 +27,12 @@ import argparse
 import fnmatch
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
 
@@ -860,6 +862,30 @@ def prompt_overlap(
         prompt_out.write(f"  invalid choice {choice!r}; enter a listed number, s, or q\n")
 
 
+def _conflict_metadata(path: Path) -> tuple[str, str, str]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        return (f"unavailable ({exc.strerror or exc})", "—", "—")
+
+    kind = "other"
+    size = "—"
+    if stat.S_ISREG(metadata.st_mode):
+        kind = "file"
+        size = f"{metadata.st_size:,} bytes"
+    elif stat.S_ISDIR(metadata.st_mode):
+        kind = "folder"
+    elif stat.S_ISLNK(metadata.st_mode):
+        kind = "symlink"
+    try:
+        modified = datetime.fromtimestamp(metadata.st_mtime, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+    except (OSError, OverflowError, ValueError):
+        modified = "unavailable"
+    return kind, size, modified
+
+
 def prompt_conflict(
     source_name: str,
     dest: Path,
@@ -874,6 +900,17 @@ def prompt_conflict(
     prompt_out.write(
         f"\nConflict: {source_name!r} already exists at {dest_rel.as_posix()}\n"
     )
+    source = cwd / source_name
+    source_metadata = _conflict_metadata(source)
+    dest_metadata = _conflict_metadata(dest)
+    source_width = max(len("Source"), *(len(value) for value in source_metadata))
+    prompt_out.write(f"  Source path: {source}\n")
+    prompt_out.write(f"  Destination path: {dest}\n")
+    prompt_out.write(f"  {'Metadata':<10} {'Source':<{source_width}}  Destination\n")
+    for label, source_value, dest_value in zip(
+        ("Type", "Size", "Modified"), source_metadata, dest_metadata
+    ):
+        prompt_out.write(f"  {label:<10} {source_value:<{source_width}}  {dest_value}\n")
     prompt_out.write("  [s] skip this item\n")
     prompt_out.write("  [r] rename to a unique name\n")
     prompt_out.write("  [o] overwrite the destination\n")

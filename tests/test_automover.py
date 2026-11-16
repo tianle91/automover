@@ -1029,6 +1029,76 @@ b:
             self.assertEqual((cwd / "pictures" / "IMG_1 (1).jpg").read_text(), "new")
             self.assertIn("renamed", out)
 
+    def test_conflict_prompt_compares_metadata_before_asking(self):
+        with write_tree({
+            "automover.yaml": SAMPLE,
+            "IMG_1.jpg": "new image",
+            "pictures/IMG_1.jpg": "old",
+        }) as name:
+            cwd = Path(name).resolve()
+            os.utime(cwd / "IMG_1.jpg", (1609459200, 1609459200))
+            os.utime(cwd / "pictures/IMG_1.jpg", (1577836800, 1577836800))
+            code, out, err = run(cwd, ["--apply"], stdin_text="s\n", tty=True)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn(f"Source path: {cwd / 'IMG_1.jpg'}", err)
+            self.assertIn(f"Destination path: {cwd / 'pictures/IMG_1.jpg'}", err)
+            self.assertRegex(err, r"Type\s+file\s+file")
+            self.assertRegex(err, r"Size\s+9 bytes\s+3 bytes")
+            self.assertRegex(
+                err,
+                r"Modified\s+2021-01-01 00:00:00 UTC\s+2020-01-01 00:00:00 UTC",
+            )
+            self.assertLess(err.index("Modified"), err.index("[s] skip"))
+            self.assertEqual((cwd / "IMG_1.jpg").read_text(), "new image")
+            self.assertEqual((cwd / "pictures/IMG_1.jpg").read_text(), "old")
+
+    def test_conflict_prompt_compares_folder_and_file(self):
+        with write_tree({
+            "automover.yaml": SAMPLE,
+            "report_folder/inside.txt": "source",
+            "documents/report_folder": "old",
+        }) as name:
+            cwd = Path(name)
+            code, out, err = run(cwd, ["--apply"], stdin_text="s\n", tty=True)
+            self.assertEqual(code, 0, err + out)
+            self.assertRegex(err, r"Type\s+folder\s+file")
+            self.assertRegex(err, r"Size\s+—\s+3 bytes")
+            self.assertTrue((cwd / "report_folder/inside.txt").is_file())
+            self.assertEqual((cwd / "documents/report_folder").read_text(), "old")
+
+    def test_conflict_prompt_describes_dangling_symlink(self):
+        with write_tree({
+            "automover.yaml": SAMPLE,
+            "IMG_1.jpg": "new",
+            "pictures": None,
+        }) as name:
+            cwd = Path(name)
+            destination = cwd / "pictures/IMG_1.jpg"
+            destination.symlink_to("missing.jpg")
+            code, out, err = run(cwd, ["--apply"], stdin_text="s\n", tty=True)
+            self.assertEqual(code, 0, err + out)
+            self.assertRegex(err, r"Type\s+file\s+symlink")
+            self.assertRegex(err, r"Size\s+3 bytes\s+—")
+            self.assertNotIn("unavailable", err)
+            self.assertTrue(destination.is_symlink())
+
+    def test_conflict_prompt_allows_decision_when_metadata_is_unreadable(self):
+        with write_tree({"IMG_1.jpg": "new"}) as name:
+            cwd = Path(name)
+            source_metadata = (cwd / "IMG_1.jpg").lstat()
+            prompt_out = io.StringIO()
+            with patch.object(
+                Path, "lstat",
+                side_effect=[source_metadata, PermissionError(13, "Permission denied")],
+            ):
+                result = automover.prompt_conflict(
+                    "IMG_1.jpg", cwd / "pictures/IMG_1.jpg", cwd,
+                    io.StringIO("s\n"), prompt_out,
+                )
+            self.assertIsNone(result)
+            self.assertIn("unavailable (Permission denied)", prompt_out.getvalue())
+            self.assertIn("Choose resolution:", prompt_out.getvalue())
+
     def test_conflict_prompt_skip(self):
         with write_tree(
             {

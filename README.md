@@ -118,6 +118,11 @@ Useful flags:
 
 If both `automover.yaml` and `automover.yml` exist, `.yaml` is used and a warning is printed.
 
+Interactive destination conflicts show the source and destination paths with a
+comparison of entry type, file size in bytes, and modification time in UTC before
+asking whether to skip, rename, overwrite, or abort. Folders and symlinks show
+their type and modification time. Unreadable metadata is marked unavailable.
+
 ## Generating a config with an AI agent
 
 `prompt` does not run a model. It lists every top-level file and folder automover would consider (plus guessed `image` / `audio` / `video` / `documents` types) and prints a filled-in schema prompt to stdout. Pipe or paste that into an agent, then save the YAML it returns as `automover.yaml`.
